@@ -14,9 +14,22 @@ BloodHound.py currently has the following limitations:
 
 ## Installation and usage
 You can install the ingestor via pip with `pip install bloodhound`, or by cloning this repository and running `python setup.py install`, or with `pip install .`.
-BloodHound.py requires `impacket`, `ldap3` and `dnspython` to function.
+BloodHound.py requires `impacket`, `ldap3`, `dnspython` and `cryptography` to function.
 
 The installation will add a command line tool `bloodhound-python` to your PATH.
+
+To run from a checkout without installing the package, install the dependencies on their own:
+
+```
+pip install -r requirements.txt
+python -m bloodhound --help
+```
+
+The test suite needs nothing beyond those dependencies:
+
+```
+python -m unittest discover -s tests
+```
 
 To use the ingestor, at a minimum you will need credentials of the domain you're logging in to.
 You will need to specify the `-u` option with a username of this domain (or `username@domain` for a user in a trusted domain). If you have your DNS set up properly and the AD domain is in your DNS search list, then BloodHound.py will automatically detect the domain for you. If not, you have to specify it manually with the `-d` option.
