@@ -26,7 +26,9 @@ import os, sys, logging, argparse, getpass, time, re, datetime
 from zipfile import ZipFile
 from bloodhound.ad.domain import AD, ADDC
 from bloodhound.ad.authentication import ADAuthentication
+from bloodhound.enumeration.certificates import CertificateServicesEnumerator
 from bloodhound.enumeration.computers import ComputerEnumerator
+from bloodhound.enumeration.gpolocalgroup import GPOLocalGroupEnumerator
 from bloodhound.enumeration.memberships import MembershipEnumerator
 from bloodhound.enumeration.domains import DomainEnumerator
 
@@ -72,7 +74,13 @@ class BloodHound(object):
             self.ad.load_cachefile(cachefile)
 
         # Check early if we should enumerate computers as well
-        do_computer_enum = any(method in collect for method in ['localadmin', 'session', 'loggedon', 'experimental', 'rdp', 'dcom', 'psremote'])
+        do_computer_enum = any(method in collect for method in ['localadmin', 'session', 'loggedon',
+                                                                'experimental', 'rdp', 'dcom', 'psremote',
+                                                                'smbinfo', 'webclientservice', 'ntlmregistry',
+                                                                'dcregistry', 'ldapservices', 'caregistry'])
+        # These need the schema GUID map and the domain objects that
+        # prefetch_info sets up, but no cache of computers to connect to
+        needs_directory_info = any(method in collect for method in ['certservices', 'gpolocalgroup'])
 
         if 'group' in collect or 'objectprops' in collect or 'acl' in collect:
             # Fetch domains for later, computers if needed
@@ -90,17 +98,43 @@ class BloodHound(object):
             # We need to know which computers to query regardless
             # We also need the domains to have a mapping from NETBIOS -> FQDN for local admins
             self.pdc.prefetch_info('objectprops' in collect, 'acl' in collect, cache_computers=True)
+        elif needs_directory_info:
+            self.pdc.prefetch_info('objectprops' in collect, 'acl' in collect)
         elif 'trusts' in collect:
             # Prefetch domains
             self.pdc.get_domains('acl' in collect)
+
+        cert_enum = None
+        if 'certservices' in collect or 'caregistry' in collect:
+            cert_enum = CertificateServicesEnumerator(self.ad, self.pdc, collect, disable_pooling)
+        if 'caregistry' in collect:
+            # Find out which CA runs where before the computers are queried, so
+            # the registry of each CA host is read while we are connected to it
+            cert_enum.prefetch_ca_hosts()
+
         if 'trusts' in collect or 'acl' in collect or 'objectprops' in collect:
             trusts_enum = DomainEnumerator(self.ad, self.pdc)
             trusts_enum.dump_domain(collect,timestamp=timestamp)
+        if 'gpolocalgroup' in collect:
+            # Has to run before the computers are written out, since the results
+            # are merged into the computer objects
+            gpo_enum = GPOLocalGroupEnumerator(self.ad, self.pdc, collect)
+            gpo_enum.enumerate_gpo_local_groups()
+            if not (do_computer_enum or 'group' in collect
+                    or 'objectprops' in collect or 'acl' in collect):
+                # Nothing else is going to write computers.json in this run,
+                # and the GPO results are carried by the computer objects
+                MembershipEnumerator(self.ad, self.pdc, collect,
+                                     disable_pooling).enumerate_computers_dconly(timestamp=timestamp)
         if do_computer_enum:
             # If we don't have a GC server, don't use it for deconflictation
             have_gc = len(self.ad.gcs()) > 0
             computer_enum = ComputerEnumerator(self.ad, self.pdc, collect, do_gc_lookup=have_gc, computerfile=computerfile, exclude_dcs=exclude_dcs)
             computer_enum.enumerate_computers(self.ad.computers, num_workers=num_workers, timestamp=timestamp)
+        if 'certservices' in collect:
+            # Last, so the enterprise CA objects carry the registry data that
+            # the CARegistry method collected from their hosts above
+            cert_enum.enumerate_certificate_services(timestamp=timestamp)
         end_time = time.time()
         minutes, seconds = divmod(int(end_time-start_time),60)
         logging.info('Done in %02dM %02dS' % (minutes, seconds))
@@ -111,12 +145,18 @@ def resolve_collection_methods(methods):
     """
     valid_methods = ['group', 'localadmin', 'session', 'trusts', 'default', 'all', 'loggedon',
                      'objectprops', 'experimental', 'acl', 'dcom', 'rdp', 'psremote', 'dconly',
-                     'container']
+                     'container', 'certservices', 'caregistry', 'dcregistry', 'ntlmregistry',
+                     'smbinfo', 'webclientservice', 'ldapservices', 'gpolocalgroup']
     default_methods = ['group', 'localadmin', 'session', 'trusts']
     # Similar to SharpHound, All is not really all, it excludes loggedon
-    all_methods = ['group', 'localadmin', 'session', 'trusts', 'objectprops', 'acl', 'dcom', 'rdp', 'psremote', 'container']
-    # DC only, does not collect to computers
-    dconly_methods = ['group', 'trusts', 'objectprops', 'acl', 'container']
+    all_methods = ['group', 'localadmin', 'session', 'trusts', 'objectprops', 'acl', 'dcom', 'rdp',
+                   'psremote', 'container', 'certservices', 'caregistry', 'dcregistry',
+                   'ntlmregistry', 'smbinfo', 'webclientservice', 'ldapservices', 'gpolocalgroup']
+    # DC only, does not connect to computers other than the DC itself.
+    # GPOLocalGroup reads SYSVOL and CertServices reads the configuration
+    # partition, so both are LDAP/SMB against a DC and belong here.
+    dconly_methods = ['group', 'trusts', 'objectprops', 'acl', 'container', 'certservices',
+                      'gpolocalgroup']
     if ',' in methods:
         method_list = [method.lower() for method in methods.split(',')]
         validated_methods = []
@@ -133,7 +173,7 @@ def resolve_collection_methods(methods):
                 validated_methods += dconly_methods
             else:
                 validated_methods.append(method)
-        return set(validated_methods)
+        return finalize_collection_methods(validated_methods)
     else:
         validated_methods = []
         # It is only one
@@ -147,10 +187,22 @@ def resolve_collection_methods(methods):
                 validated_methods += dconly_methods
             else:
                 validated_methods.append(method)
-            return set(validated_methods)
+            return finalize_collection_methods(validated_methods)
         else:
             logging.error('Invalid collection method specified: %s', method)
             return False
+
+def finalize_collection_methods(validated_methods):
+    """
+    Resolve dependencies between collection methods.
+    """
+    methods = set(validated_methods)
+    # The CA registry data is written out as part of the enterprise CA objects,
+    # so collecting it without CertServices would throw the results away.
+    if 'caregistry' in methods and 'certservices' not in methods:
+        logging.info('CARegistry requires CertServices to output its results, enabling it')
+        methods.add('certservices')
+    return methods
 
 def main():
 #    logging.basicConfig(stream=sys.stderr, level=logging.INFO)
@@ -171,8 +223,10 @@ def main():
                         action='store',
                         default='Default',
                         help='Which information to collect. Supported: Group, LocalAdmin, Session, '
-                             'Trusts, Default (all previous), DCOnly (no computer connections), DCOM, RDP,'
-                             'PSRemote, LoggedOn, Container, ObjectProps, ACL, All (all except LoggedOn). '
+                             'Trusts, Default (all previous), DCOnly (no computer connections), DCOM, RDP, '
+                             'PSRemote, LoggedOn, Container, ObjectProps, ACL, CertServices, CARegistry, '
+                             'DCRegistry, NTLMRegistry, SMBInfo, WebClientService, LdapServices, '
+                             'GPOLocalGroup, All (all except LoggedOn). '
                              'You can specify more than one by separating them with a comma. (default: Default)')
     parser.add_argument('-d',
                         '--domain',
