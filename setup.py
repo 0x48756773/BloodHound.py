@@ -13,7 +13,9 @@ setup(name='bloodhound',
                 'bloodhound.lib',
                 'bloodhound.enumeration'],
       license='MIT',
-      install_requires=['dnspython', 'impacket>=0.9.17', 'ldap3>=2.5,!=2.5.2,!=2.5.0,!=2.6', 'pyasn1>=0.4', 'future'],
+      # cryptography is used to read the certificates collected by CertServices.
+      # It is already an impacket dependency, but this does not rely on that.
+      install_requires=['dnspython', 'impacket>=0.9.17', 'ldap3>=2.5,!=2.5.2,!=2.5.0,!=2.6', 'pyasn1>=0.4', 'future', 'cryptography'],
       classifiers=[
         'Intended Audience :: Information Technology',
         'License :: OSI Approved :: MIT License',

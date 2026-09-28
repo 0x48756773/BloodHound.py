@@ -27,18 +27,20 @@ import traceback
 import calendar
 import time
 import re
+from ldap3 import Server, Connection, NTLM, NONE
 from impacket.dcerpc.v5 import transport, samr, srvs, lsat, lsad, nrpc, wkst, scmr, tsch, rrp
 from impacket.dcerpc.v5.rpcrt import DCERPCException, RPC_C_AUTHN_LEVEL_PKT_INTEGRITY
 from impacket.dcerpc.v5.ndr import NULL
 from impacket.dcerpc.v5.dtypes import RPC_SID, MAXIMUM_ALLOWED
+from bloodhound.ad.adcs import EDITF_ATTRIBUTESUBJECTALTNAME2
 from bloodhound.ad.utils import ADUtils, AceResolver
-from bloodhound.enumeration.acls import parse_binary_acl
+from bloodhound.enumeration.acls import parse_binary_acl, parse_ca_security, parse_enrollment_agent_restrictions
 from bloodhound.ad.structures import LDAP_SID
 from impacket.smb3 import SMB3
 from impacket.smb import SMB
-from impacket.smbconnection import SessionError
+from impacket.smbconnection import SessionError, SMB_DIALECT
 from impacket import smb
-from impacket.smb3structs import SMB2_DIALECT_21
+from impacket.smb3structs import SMB2_DIALECT_21, FILE_READ_DATA
 # Try to import exceptions here, if this does not succeed, then impacket version is too old
 try:
     HostnameValidationExceptions = (SMB3.HostnameValidationException, SMB.HostnameValidationException)
@@ -49,6 +51,21 @@ class ADComputer(object):
     """
     Computer connected to Active Directory
     """
+
+    # Registry locations read by the CARegistry, DCRegistry and NTLMRegistry
+    # collection methods.
+    CERTSVC_CONFIG_KEY = 'SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration'
+    SCHANNEL_KEY = 'SYSTEM\\CurrentControlSet\\Control\\SecurityProviders\\Schannel'
+    KDC_KEY = 'SYSTEM\\CurrentControlSet\\Services\\Kdc'
+    LSA_MSV_KEY = 'SYSTEM\\CurrentControlSet\\Control\\Lsa\\MSV1_0'
+    NTDS_PARAMETERS_KEY = 'SYSTEM\\CurrentControlSet\\Services\\NTDS\\Parameters'
+
+    # Error codes that mean "this key or value does not exist", as opposed to
+    # "we were not allowed to look". Only the former lets us fall back to the
+    # documented Windows default for a setting.
+    ERROR_FILE_NOT_FOUND = 2
+    ERROR_PATH_NOT_FOUND = 3
+
     def __init__(self, hostname=None, samname=None, ad=None, addc=None, objectsid=None):
         self.ad = ad
         self.addc = addc
@@ -64,6 +81,9 @@ class ADComputer(object):
         self.sessions = []
         self.loggedon = []
         self.registry_sessions = []
+        # Extra computer properties gathered by the registry, SMB and LDAP
+        # based collection methods. Merged into Properties on output.
+        self.host_properties = {}
         self.addr = None
         self.smbconnection = None
         self.TGS = None
@@ -84,37 +104,46 @@ class ADComputer(object):
         else:
             self.hostname = hostname
 
+    def local_group_data(self, method, results, gpo_key, collect):
+        """
+        Build one of the local group sections of the computer object.
+
+        Membership can come from two places: what we read off the host itself,
+        and what Group Policy hands it. The GPO half is collected centrally
+        from SYSVOL, so it is present even for a host we never reached - which
+        is why 'Collected' is true when either source ran.
+        """
+        merged = list(results)
+        if 'gpolocalgroup' in collect and self.ad is not None:
+            gpo_members = self.ad.gpo_local_groups.get(self.objectsid, {}).get(gpo_key, [])
+            seen = set((member['ObjectIdentifier'], member['ObjectType']) for member in merged)
+            for member in gpo_members:
+                key = (member['ObjectIdentifier'], member['ObjectType'])
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(member)
+        collected = (method in collect and not self.permanentfailure) or 'gpolocalgroup' in collect
+        return {
+            'Collected': collected,
+            'FailureReason': None,
+            'Results': merged,
+        }
+
     def get_bloodhound_data(self, entry, collect, skip_acl=False):
         data = {
             'ObjectIdentifier': self.objectsid,
             'AllowedToAct': [],
             'PrimaryGroupSID': self.primarygroup,
-            'LocalAdmins': {
-                'Collected': 'localadmin' in collect and not self.permanentfailure,
-                'FailureReason': None,
-                'Results': self.admins,
-            },
-            'PSRemoteUsers': {
-                'Collected': 'psremote' in collect and not self.permanentfailure,
-                'FailureReason': None,
-                'Results': self.psremote
-            },
+            'LocalAdmins': self.local_group_data('localadmin', self.admins, 'admins', collect),
+            'PSRemoteUsers': self.local_group_data('psremote', self.psremote, 'psremote', collect),
             'Properties': {
                 'name': self.hostname.upper(),
                 'domainsid': self.ad.domain_object.sid,
                 'domain': self.ad.domain.upper(),
                 'distinguishedname': ADUtils.get_entry_property(entry, 'distinguishedName').upper()
             },
-            'RemoteDesktopUsers': {
-                'Collected': 'rdp' in collect and not self.permanentfailure,
-                'FailureReason': None,
-                'Results': self.rdp
-            },
-            'DcomUsers': {
-                'Collected': 'dcom' in collect and not self.permanentfailure,
-                'FailureReason': None,
-                'Results': self.dcom
-            },
+            'RemoteDesktopUsers': self.local_group_data('rdp', self.rdp, 'rdp', collect),
+            'DcomUsers': self.local_group_data('dcom', self.dcom, 'dcom', collect),
             'AllowedToDelegate': [],
             'Sessions': {
                 'Collected': 'session' in collect and not self.permanentfailure,
@@ -143,6 +172,12 @@ class ADComputer(object):
         props['enabled'] = ADUtils.get_entry_property(entry, 'userAccountControl', default=0) & 2 == 0
         props['trustedtoauth'] = ADUtils.get_entry_property(entry, 'userAccountControl', default=0) & 0x01000000 == 0x01000000
         props['samaccountname'] = ADUtils.get_entry_property(entry, 'sAMAccountName')
+        props['isdc'] = ADUtils.is_dc(entry)
+
+        # Properties gathered from the host itself by the registry, SMB and
+        # LDAP based collection methods. Added last so they win over anything
+        # derived from LDAP, since they describe the live configuration.
+        props.update(self.host_properties)
 
         if 'objectprops' in collect or 'acl' in collect:
             props['haslaps'] = ADUtils.get_entry_property(entry, 'ms-mcs-admpwdexpirationtime', 0) != 0
@@ -548,6 +583,404 @@ class ADComputer(object):
         dce.disconnect()
 
         return registry_sessions
+
+    def ensure_smb_connection(self):
+        """
+        Make sure an authenticated SMB connection to this host exists.
+
+        The SMB connection is normally a side effect of the first DCE/RPC bind.
+        When only SMB based collection methods are selected nothing has bound
+        yet, so bind to srvsvc - present on every Windows host - purely to set
+        one up. dce_rpc_connect hands the SMB connection back to the transport,
+        so it survives the disconnect below.
+        """
+        if self.smbconnection is not None:
+            return self.smbconnection
+        if self.permanentfailure:
+            return None
+        binding = r'ncacn_np:%s[\PIPE\srvsvc]' % self.addr
+        dce = self.dce_rpc_connect(binding, srvs.MSRPC_UUID_SRVS)
+        if dce is not None:
+            dce.disconnect()
+        return self.smbconnection
+
+    def rpc_open_registry(self):
+        """
+        Bind to the Remote Registry service on this host.
+
+        The service is demand-started on current Windows versions, so the first
+        attempt can fail while it spins up - that attempt is what triggers the
+        start, which is why a single retry is worth it.
+        """
+        binding = r'ncacn_np:%s[\pipe\winreg]' % self.addr
+        for attempt in range(2):
+            dce = self.dce_rpc_connect(binding, rrp.MSRPC_UUID_RRP)
+            if dce is not None:
+                return dce
+            if attempt == 0:
+                time.sleep(1)
+        logging.debug('Could not open the remote registry on %s', self.hostname)
+        return None
+
+    def registry_open_hklm(self, dce):
+        try:
+            return rrp.hOpenLocalMachine(dce)['phKey']
+        except Exception as exc:
+            logging.debug('Could not open HKLM on %s: %s', self.hostname, exc)
+            return None
+
+    @staticmethod
+    def _is_missing_error(exc):
+        """
+        Tell "does not exist" apart from "not allowed" on a registry read.
+        """
+        getter = getattr(exc, 'get_error_code', None)
+        if getter is None:
+            return False
+        try:
+            return getter() in (ADComputer.ERROR_FILE_NOT_FOUND, ADComputer.ERROR_PATH_NOT_FOUND)
+        except Exception:
+            return False
+
+    def registry_read_value(self, dce, hive, subkey, valuename, missing=None):
+        """
+        Read a single value from the remote registry.
+
+        Returns `missing` when the key or value genuinely is not there, which
+        lets the caller substitute the documented Windows default. Returns None
+        when the read failed for any other reason - access denied, RPC error -
+        since that tells us nothing about the setting's actual value.
+        """
+        if hive is None:
+            return None
+        key_handle = None
+        try:
+            key_handle = rrp.hBaseRegOpenKey(dce, hive, subkey)['phkResult']
+        except Exception as exc:
+            if self._is_missing_error(exc):
+                return missing
+            logging.debug('Could not open registry key %s on %s: %s', subkey, self.hostname, exc)
+            return None
+        try:
+            _, value = rrp.hBaseRegQueryValue(dce, key_handle, valuename)
+            return value
+        except Exception as exc:
+            if self._is_missing_error(exc):
+                return missing
+            logging.debug('Could not read registry value %s\\%s on %s: %s',
+                          subkey, valuename, self.hostname, exc)
+            return None
+        finally:
+            try:
+                rrp.hBaseRegCloseKey(dce, key_handle)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _uncollected(reason, key='Data', default=None):
+        return {'Collected': False, 'FailureReason': reason, key: default if default is not None else []}
+
+    def rpc_get_ca_registry(self, cas):
+        """
+        Read the registry configuration of the Certificate Authorities hosted on
+        this computer (the CARegistry collection method).
+
+        `cas` is the list of enterprise CAs the CertServices method found on
+        this host; each entry has a 'name' and an 'objectidentifier'. Results
+        are keyed on the object identifier so the enterprise CA objects can be
+        updated with them afterwards.
+        """
+        results = {}
+        dce = self.rpc_open_registry()
+        if dce is None:
+            reason = 'Could not connect to the remote registry'
+            for ca in cas:
+                results[ca['objectidentifier']] = {
+                    'CASecurity': self._uncollected(reason),
+                    'EnrollmentAgentRestrictions': self._uncollected(reason),
+                    'IsUserSpecifiesSanEnabled': {'Collected': False, 'FailureReason': reason, 'Value': False},
+                }
+            return results
+
+        hive = self.registry_open_hklm(dce)
+        for ca in cas:
+            caname = ca['name']
+            ca_key = '%s\\%s' % (self.CERTSVC_CONFIG_KEY, caname)
+
+            security = self.registry_read_value(dce, hive, ca_key, 'Security')
+            if security is None:
+                casecurity = self._uncollected('Could not read the CA security descriptor')
+            else:
+                casecurity = {
+                    'Collected': True,
+                    'FailureReason': None,
+                    'Data': self.aceresolver.resolve_aces(parse_ca_security(security)),
+                }
+
+            agentrights = self.registry_read_value(dce, hive, ca_key, 'EnrollmentAgentRights', missing=b'')
+            if agentrights is None:
+                restrictions = self._uncollected('Could not read the enrollment agent rights')
+            else:
+                # An absent value means the CA places no restrictions on
+                # enrollment agents, which is collected data, not a failure.
+                restrictions = {
+                    'Collected': True,
+                    'FailureReason': None,
+                    'Data': parse_enrollment_agent_restrictions(agentrights),
+                }
+
+            policy_key = '%s\\PolicyModules\\CertificateAuthority_MicrosoftDefault.Policy' % ca_key
+            editflags = self.registry_read_value(dce, hive, policy_key, 'EditFlags')
+            if editflags is None:
+                san = {'Collected': False,
+                       'FailureReason': 'Could not read the CA policy module EditFlags',
+                       'Value': False}
+            else:
+                san = {
+                    'Collected': True,
+                    'FailureReason': None,
+                    'Value': int(editflags) & EDITF_ATTRIBUTESUBJECTALTNAME2 == EDITF_ATTRIBUTESUBJECTALTNAME2,
+                }
+
+            results[ca['objectidentifier']] = {
+                'CASecurity': casecurity,
+                'EnrollmentAgentRestrictions': restrictions,
+                'IsUserSpecifiesSanEnabled': san,
+            }
+
+        dce.disconnect()
+        return results
+
+    def rpc_get_dc_registry(self):
+        """
+        Read the certificate mapping configuration of a domain controller (the
+        DCRegistry collection method).
+
+        Both settings decide how loosely a certificate may be mapped to an
+        account, which is what makes them interesting for certificate based
+        attack paths.
+        """
+        props = {}
+        dce = self.rpc_open_registry()
+        if dce is None:
+            return props
+        hive = self.registry_open_hklm(dce)
+
+        # Absent means the Schannel default of 0x18 (UPN and S4U2Self mapping)
+        mapping = self.registry_read_value(dce, hive, self.SCHANNEL_KEY,
+                                           'CertificateMappingMethods', missing=0x18)
+        if mapping is not None:
+            props['certificatemappingmethods'] = int(mapping)
+
+        # Absent means the KDC default of 1 (compatibility mode) as documented
+        # for the certificate based authentication hardening in KB5014754
+        binding = self.registry_read_value(dce, hive, self.KDC_KEY,
+                                           'StrongCertificateBindingEnforcement', missing=1)
+        if binding is not None:
+            props['strongcertificatebindingenforcement'] = int(binding)
+
+        dce.disconnect()
+        return props
+
+    def rpc_get_ntlm_registry(self, is_dc=False):
+        """
+        Read the NTLM restriction settings of this host (the NTLMRegistry
+        collection method).
+
+        On domain controllers this also picks up the LDAP signing and channel
+        binding requirements, which is a more reliable answer than probing the
+        LDAP service from outside.
+        """
+        props = {}
+        dce = self.rpc_open_registry()
+        if dce is None:
+            return props
+        hive = self.registry_open_hklm(dce)
+
+        # Both default to 0, meaning no restriction
+        outbound = self.registry_read_value(dce, hive, self.LSA_MSV_KEY,
+                                            'RestrictSendingNTLMTraffic', missing=0)
+        if outbound is not None:
+            props['restrictoutboundntlm'] = int(outbound) != 0
+        inbound = self.registry_read_value(dce, hive, self.LSA_MSV_KEY,
+                                           'RestrictReceivingNTLMTraffic', missing=0)
+        if inbound is not None:
+            props['restrictreceivingntlmtraffic'] = int(inbound) != 0
+
+        # No documented default that holds across versions, so these are only
+        # reported when the value is actually set
+        minserversec = self.registry_read_value(dce, hive, self.LSA_MSV_KEY, 'NtlmMinServerSec')
+        if minserversec is not None:
+            props['ntlmminserversec'] = int(minserversec)
+        minclientsec = self.registry_read_value(dce, hive, self.LSA_MSV_KEY, 'NtlmMinClientSec')
+        if minclientsec is not None:
+            props['ntlmminclientsec'] = int(minclientsec)
+
+        if is_dc:
+            # Defaults: channel binding off, LDAP server integrity negotiated
+            channelbinding = self.registry_read_value(dce, hive, self.NTDS_PARAMETERS_KEY,
+                                                      'LdapEnforceChannelBinding', missing=0)
+            if channelbinding is not None:
+                props['ldapenforcechannelbinding'] = int(channelbinding)
+                props['ldapsepa'] = int(channelbinding) != 0
+            integrity = self.registry_read_value(dce, hive, self.NTDS_PARAMETERS_KEY,
+                                                 'LDAPServerIntegrity', missing=1)
+            if integrity is not None:
+                props['ldapserverintegrity'] = int(integrity)
+                # 2 means signing is required, 1 means it is merely negotiated
+                props['ldapsigning'] = int(integrity) == 2
+
+        dce.disconnect()
+        return props
+
+    def smb_get_info(self):
+        """
+        Collect what the SMB session itself tells us about the host (the
+        SMBInfo collection method): whether signing is required, which dialect
+        was negotiated and the OS version reported during negotiation.
+        """
+        props = {}
+        smbconnection = self.ensure_smb_connection()
+        if smbconnection is None:
+            logging.debug('No SMB connection to %s, skipping SMBInfo', self.hostname)
+            return props
+        try:
+            props['smbsigning'] = bool(smbconnection.isSigningRequired())
+        except Exception as exc:
+            logging.debug('Could not determine SMB signing on %s: %s', self.hostname, exc)
+        try:
+            dialect = smbconnection.getDialect()
+            props['issmbv1enabled'] = dialect == SMB_DIALECT
+        except Exception as exc:
+            logging.debug('Could not determine SMB dialect on %s: %s', self.hostname, exc)
+        try:
+            major = smbconnection.getServerOSMajor()
+            minor = smbconnection.getServerOSMinor()
+            build = smbconnection.getServerOSBuild()
+            if major:
+                props['osversion'] = '%d.%d (%d)' % (major, minor or 0, build or 0)
+        except Exception as exc:
+            logging.debug('Could not determine OS version of %s: %s', self.hostname, exc)
+        return props
+
+    def check_webclient_service(self):
+        """
+        Detect whether the WebClient (WebDAV) service is running on this host
+        (the WebClientService collection method).
+
+        The service publishes the 'DAV RPC SERVICE' named pipe and only while
+        it runs, so trying to open that pipe answers the question without
+        needing to read the service database. Access denied on the pipe still
+        proves it exists, so that counts as running.
+        """
+        smbconnection = self.ensure_smb_connection()
+        if smbconnection is None:
+            logging.debug('No SMB connection to %s, skipping WebClientService', self.hostname)
+            return None
+        tid = None
+        try:
+            tid = smbconnection.connectTree('IPC$')
+            # Read access only: we never talk to the pipe, we only need to know
+            # whether it is there, and asking for write access invites a denial
+            fid = smbconnection.openFile(tid, r'\DAV RPC SERVICE', desiredAccess=FILE_READ_DATA)
+            smbconnection.closeFile(tid, fid)
+            logging.debug('WebClient service is running on %s', self.hostname)
+            return True
+        except SessionError as exc:
+            message = str(exc)
+            if 'STATUS_OBJECT_NAME_NOT_FOUND' in message or 'STATUS_OBJECT_PATH_NOT_FOUND' in message:
+                return False
+            if 'STATUS_ACCESS_DENIED' in message or 'STATUS_PIPE_NOT_AVAILABLE' in message:
+                # The pipe is there, we just cannot open it
+                return True
+            logging.debug('WebClient check failed on %s: %s', self.hostname, message)
+            return None
+        except Exception as exc:
+            logging.debug('WebClient check failed on %s: %s', self.hostname, exc)
+            return None
+        finally:
+            if tid is not None:
+                try:
+                    smbconnection.disconnectTree(tid)
+                except Exception:
+                    pass
+
+    def check_ldap_services(self):
+        """
+        Probe the LDAP and LDAPS services on this host (the LdapServices
+        collection method).
+
+        Availability is a plain TCP check. Signing and channel binding are
+        inferred from how the service answers a bind that carries neither; see
+        ldap_rejects_unprotected_bind for the caveats on that.
+        """
+        props = {}
+        ldap_open = ADUtils.tcp_ping(self.addr, 389)
+        ldaps_open = ADUtils.tcp_ping(self.addr, 636)
+        props['ldapavailable'] = ldap_open
+        props['ldapsavailable'] = ldaps_open
+
+        if ldap_open:
+            signing = self.ldap_rejects_unprotected_bind(389, use_ssl=False)
+            if signing is not None:
+                props['ldapsigning'] = signing
+        if ldaps_open:
+            epa = self.ldap_rejects_unprotected_bind(636, use_ssl=True)
+            if epa is not None:
+                props['ldapsepa'] = epa
+        return props
+
+    def ldap_rejects_unprotected_bind(self, port, use_ssl):
+        """
+        Test whether an LDAP service refuses a bind with no signing and no
+        channel binding token.
+
+        ldap3's NTLM bind sends neither, so a server that insists on either
+        answers strongerAuthRequired (result code 8). Two caveats: this needs a
+        password or NT hash, since a Kerberos-only run has no NTLM credentials
+        to bind with; and a server set to the "when supported" channel binding
+        level accepts this bind, so it reads as not enforced. The registry
+        values collected by NTLMRegistry are the authoritative answer where
+        they are readable.
+
+        Returns True/False, or None when the question could not be answered.
+        """
+        auth = self.ad.auth
+        if auth.nt_hash:
+            password = '%s:%s' % (auth.lm_hash or 'aad3b435b51404eeaad3b435b51404ee', auth.nt_hash)
+        elif auth.password:
+            password = auth.password
+        else:
+            logging.debug('No NTLM credentials available, cannot probe LDAP protection on %s', self.hostname)
+            return None
+
+        connection = None
+        try:
+            server = Server(self.hostname, port=port, use_ssl=use_ssl, get_info=NONE, connect_timeout=3)
+            connection = Connection(server,
+                                    user='%s\\%s' % (auth.userdomain, auth.username),
+                                    password=password,
+                                    authentication=NTLM,
+                                    auto_bind=False,
+                                    raise_exceptions=False)
+            if connection.bind():
+                return False
+            result = connection.result or {}
+            # 8 is strongerAuthRequired
+            if result.get('result') == 8:
+                return True
+            logging.debug('LDAP bind to %s:%d was refused with %s, assuming no signing requirement',
+                          self.hostname, port, result.get('description'))
+            return False
+        except Exception as exc:
+            logging.debug('Could not probe LDAP on %s:%d: %s', self.hostname, port, exc)
+            return None
+        finally:
+            if connection is not None:
+                try:
+                    connection.unbind()
+                except Exception:
+                    pass
 
     """
     """

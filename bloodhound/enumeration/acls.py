@@ -39,8 +39,31 @@ EXTRIGHTS_GUID_MAPPING = {
     "WriteMember": string_to_bin("bf9679c0-0de6-11d0-a285-00aa003049e2"),
     "UserForceChangePassword": string_to_bin("00299570-246d-11d0-a768-00aa006e0529"),
     "AllowedToAct": string_to_bin("3f78c3e5-f79a-46bd-a0b8-9d18116ddc79"),
-    "UserAccountRestrictionsSet": string_to_bin("4c164200-20c0-11d0-a768-00aa006e0529")
+    "UserAccountRestrictionsSet": string_to_bin("4c164200-20c0-11d0-a768-00aa006e0529"),
+    # AD CS enrollment rights, used by the CertServices collection method
+    "Enroll": string_to_bin("0e10c968-78fb-11d2-90d4-00c04f79dc55"),
+    "AutoEnroll": string_to_bin("a05b8cc2-17bc-4802-a710-e7c15ab866a2"),
+    # Template properties whose write access is an escalation path on its own:
+    # the enrollment flag controls manager approval, the name flag controls
+    # whether the requester may supply their own subject.
+    "PKIEnrollmentFlag": string_to_bin("d15ef7d8-f226-46db-ae79-b34e560bd12c"),
+    "PKINameFlag": string_to_bin("ea1dddc4-60ff-416e-8cc0-17cee534bce7"),
 }
+
+# Object types we collect, mapped to the schema class name that identifies them
+# in objecttype_guid_map. Only needed for types whose BloodHound name differs
+# from the schema name.
+ENTRYTYPE_SCHEMA_CLASS = {
+    'gpo': 'group-policy-container',
+    'certtemplate': 'pki-certificate-template',
+    'enterpriseca': 'pki-enrollment-service',
+    'rootca': 'certification-authority',
+    'aiaca': 'certification-authority',
+    'ntauthstore': 'certification-authority',
+}
+
+# The AD CS object types, which all share the same set of collected rights.
+CERT_ENTRYTYPES = ('certtemplate', 'enterpriseca', 'rootca', 'aiaca', 'ntauthstore')
 
 def parse_binary_acl(entry, entrytype, acl, objecttype_guid_map):
     """
@@ -132,8 +155,14 @@ def parse_binary_acl(entry, entrytype, acl, objecttype_guid_map):
             writeprivs = ace_object.acedata.mask.has_priv(ACCESS_MASK.ADS_RIGHT_DS_WRITE_PROP)
             if writeprivs:
                 # GenericWrite
-                if entrytype in ['user', 'group', 'computer', 'gpo'] and not ace_object.acedata.has_flag(ACCESS_ALLOWED_OBJECT_ACE.ACE_OBJECT_TYPE_PRESENT):
+                if entrytype in ['user', 'group', 'computer', 'gpo'] + list(CERT_ENTRYTYPES) and not ace_object.acedata.has_flag(ACCESS_ALLOWED_OBJECT_ACE.ACE_OBJECT_TYPE_PRESENT):
                     relations.append(build_relation(sid, 'GenericWrite', inherited=is_inherited))
+                # Writing either of these template flags is enough to make a
+                # template abusable, so they are tracked as their own edges
+                if entrytype == 'certtemplate' and can_write_property(ace_object, EXTRIGHTS_GUID_MAPPING['PKIEnrollmentFlag']):
+                    relations.append(build_relation(sid, 'WritePKIEnrollmentFlag', inherited=is_inherited))
+                if entrytype == 'certtemplate' and can_write_property(ace_object, EXTRIGHTS_GUID_MAPPING['PKINameFlag']):
+                    relations.append(build_relation(sid, 'WritePKINameFlag', inherited=is_inherited))
                 if entrytype == 'group' and can_write_property(ace_object, EXTRIGHTS_GUID_MAPPING['WriteMember']):
                     relations.append(build_relation(sid, 'AddMember', '', inherited=is_inherited))
                 if entrytype == 'computer' and can_write_property(ace_object, EXTRIGHTS_GUID_MAPPING['AllowedToAct']):
@@ -184,6 +213,12 @@ def parse_binary_acl(entry, entrytype, acl, objecttype_guid_map):
                     relations.append(build_relation(sid, 'GetChangesInFilteredSet', '', inherited=is_inherited))
                 if entrytype == 'user' and has_extended_right(ace_object, EXTRIGHTS_GUID_MAPPING['UserForceChangePassword']):
                     relations.append(build_relation(sid, 'ForceChangePassword', '', inherited=is_inherited))
+                # AD CS: enrollment is an extended right on templates and on the
+                # enrollment service object of the CA that publishes them
+                if entrytype in CERT_ENTRYTYPES and not ace_object.acedata.has_flag(ACCESS_ALLOWED_OBJECT_ACE.ACE_OBJECT_TYPE_PRESENT):
+                    relations.append(build_relation(sid, 'AllExtendedRights', '', inherited=is_inherited))
+                if entrytype in ('certtemplate', 'enterpriseca') and has_extended_right(ace_object, EXTRIGHTS_GUID_MAPPING['Enroll']):
+                    relations.append(build_relation(sid, 'Enroll', '', inherited=is_inherited))
 
         if ace_object.ace.AceType == 0x00:
             is_inherited = ace_object.has_flag(ACE.INHERITED_ACE)
@@ -200,8 +235,12 @@ def parse_binary_acl(entry, entrytype, acl, objecttype_guid_map):
 
             if mask.has_priv(ACCESS_MASK.ADS_RIGHT_DS_WRITE_PROP):
                 # Genericwrite is only for properties, don't skip after
-                if entrytype in ['user', 'group', 'computer', 'gpo']:
+                if entrytype in ['user', 'group', 'computer', 'gpo'] + list(CERT_ENTRYTYPES):
                     relations.append(build_relation(sid, 'GenericWrite', inherited=is_inherited))
+                # A write to every property covers both template flags
+                if entrytype == 'certtemplate':
+                    relations.append(build_relation(sid, 'WritePKIEnrollmentFlag', inherited=is_inherited))
+                    relations.append(build_relation(sid, 'WritePKINameFlag', inherited=is_inherited))
 
             if mask.has_priv(ACCESS_MASK.WRITE_OWNER):
                 relations.append(build_relation(sid, 'WriteOwner', inherited=is_inherited))
@@ -209,6 +248,13 @@ def parse_binary_acl(entry, entrytype, acl, objecttype_guid_map):
             # For users and domain, check extended rights
             if entrytype in ['user', 'domain'] and mask.has_priv(ACCESS_MASK.ADS_RIGHT_DS_CONTROL_ACCESS):
                 relations.append(build_relation(sid, 'AllExtendedRights', '', inherited=is_inherited))
+
+            # AD CS objects: no object type on the ACE means every extended
+            # right, and for templates and CAs that includes enrollment
+            if entrytype in CERT_ENTRYTYPES and mask.has_priv(ACCESS_MASK.ADS_RIGHT_DS_CONTROL_ACCESS):
+                relations.append(build_relation(sid, 'AllExtendedRights', '', inherited=is_inherited))
+                if entrytype in ('certtemplate', 'enterpriseca'):
+                    relations.append(build_relation(sid, 'Enroll', '', inherited=is_inherited))
 
             # Also report all extended if no laps
             if entrytype == 'computer' and mask.has_priv(ACCESS_MASK.ADS_RIGHT_DS_CONTROL_ACCESS) and \
@@ -264,15 +310,106 @@ def ace_applies(ace_guid, object_class, objecttype_guid_map):
     Note that this function assumes you already verified that InheritedObjectType is set (via the flag).
     If this is not set, the ACE applies to all object types.
     '''
-    if ace_guid == objecttype_guid_map[object_class]:
-        return True
-    # If none of these match, the ACE does not apply to this object
-    return False
+    # Some object types are named differently in the schema than in BloodHound
+    schema_class = ENTRYTYPE_SCHEMA_CLASS.get(object_class, object_class)
+    try:
+        return ace_guid == objecttype_guid_map[schema_class]
+    except KeyError:
+        # A class we don't have a schema GUID for. Reporting the ACE as
+        # inapplicable is the safe answer: this runs inside the ACL worker pool,
+        # where raising would take out the whole object's ACL collection.
+        logging.debug('No schema GUID known for object class %s, treating inherited ACE as not applicable', schema_class)
+        return False
 
 def build_relation(sid, relation, acetype='', inherited=False):
     if acetype != '':
         raise ValueError("BH 4.0 incompatible output called")
     return {'rightname': relation, 'sid': sid, 'inherited': inherited}
+
+# Access rights in a Certificate Authority's own security descriptor, which is
+# stored in the CA host's registry rather than in AD and uses its own bitmask.
+# See MS-CSRA 3.1.1.7 and MS-WCCE 3.2.1.4.2.1.
+CA_ACCESS_MANAGE_CA = 0x00000001
+CA_ACCESS_MANAGE_CERTIFICATES = 0x00000002
+CA_ACCESS_ENROLL = 0x00000200
+
+def parse_ca_security(acl):
+    """
+    Parse the binary security descriptor read from a CA's 'Security' registry
+    value into BloodHound relations.
+
+    This deliberately does not reuse parse_binary_acl: that function interprets
+    the access mask as Active Directory object rights, and the same bits mean
+    something entirely different here.
+    """
+    if not acl:
+        return []
+    try:
+        sd = SecurityDescriptor(BytesIO(acl))
+    except Exception as exc:
+        logging.debug('Could not parse CA security descriptor: %s', exc)
+        return []
+    if not sd.dacl:
+        return []
+
+    relations = []
+    # Creator Owner / Local System / Principal Self, as elsewhere
+    ignoresids = ["S-1-3-0", "S-1-5-18", "S-1-5-10"]
+    for ace_object in sd.dacl.aces:
+        # Only plain allow ACEs are meaningful here; the CA does not use
+        # object ACEs in this descriptor.
+        if ace_object.ace.AceType != 0x00:
+            continue
+        sid = str(ace_object.acedata.sid)
+        if sid in ignoresids:
+            continue
+        mask = ace_object.acedata.mask
+        if mask.has_priv(CA_ACCESS_MANAGE_CA):
+            relations.append(build_relation(sid, 'ManageCA', inherited=False))
+        if mask.has_priv(CA_ACCESS_MANAGE_CERTIFICATES):
+            relations.append(build_relation(sid, 'ManageCertificates', inherited=False))
+        if mask.has_priv(CA_ACCESS_ENROLL):
+            relations.append(build_relation(sid, 'Enroll', inherited=False))
+    return relations
+
+def parse_enrollment_agent_restrictions(acl):
+    """
+    Parse a CA's 'EnrollmentAgentRights' security descriptor.
+
+    Each allow ACE names an enrollment agent (the trustee). The ACE's
+    ObjectType, when present, restricts the agent to one certificate template
+    and the InheritedObjectType restricts which principals it may enroll on
+    behalf of. Both are reported as raw GUIDs: mapping them back to template
+    names needs the template OID table, which is not available to this parser.
+    """
+    if not acl:
+        return []
+    try:
+        sd = SecurityDescriptor(BytesIO(acl))
+    except Exception as exc:
+        logging.debug('Could not parse enrollment agent restrictions: %s', exc)
+        return []
+    if not sd.dacl:
+        return []
+
+    restrictions = []
+    for ace_object in sd.dacl.aces:
+        if ace_object.ace.AceType not in (0x00, 0x05):
+            continue
+        sid = str(ace_object.acedata.sid)
+        template = None
+        targets = []
+        if ace_object.ace.AceType == 0x05:
+            if ace_object.acedata.has_flag(ACCESS_ALLOWED_OBJECT_ACE.ACE_OBJECT_TYPE_PRESENT):
+                template = ace_object.acedata.get_object_type()
+            if ace_object.acedata.has_flag(ACCESS_ALLOWED_OBJECT_ACE.ACE_INHERITED_OBJECT_TYPE_PRESENT):
+                targets.append(ace_object.acedata.get_inherited_object_type())
+        restrictions.append({
+            'Agent': sid,
+            'Template': template,
+            'Targets': targets,
+        })
+    return restrictions
 
 class AclEnumerator(object):
     """

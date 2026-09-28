@@ -519,6 +519,114 @@ class ADDC(ADComputer):
                               generator=True)
         return entries
 
+    def get_configuration_nc(self):
+        """
+        DN of the Configuration naming context. AD CS objects live here rather
+        than in the domain partition, which is why they are collected once per
+        forest instead of once per domain.
+        """
+        try:
+            return self.ldap.server.info.other['configurationNamingContext'][0]
+        except (KeyError, IndexError, AttributeError):
+            logging.warning('Could not determine the configuration naming context')
+            return None
+
+    def get_pki_services_dn(self):
+        """
+        Container holding every AD CS object: templates, enrollment services,
+        the NTAuth store and the CA certificate stores.
+        """
+        configuration_nc = self.get_configuration_nc()
+        if not configuration_nc:
+            return None
+        return 'CN=Public Key Services,CN=Services,%s' % configuration_nc
+
+    def get_cert_templates(self, include_properties=False, acl=False):
+        properties = ['distinguishedName', 'name', 'displayName', 'objectGUID',
+                      'msPKI-Certificate-Name-Flag', 'msPKI-Enrollment-Flag',
+                      'msPKI-Private-Key-Flag', 'msPKI-Certificate-Application-Policy',
+                      'msPKI-RA-Signature', 'msPKI-RA-Application-Policies',
+                      'msPKI-Template-Schema-Version', 'msPKI-Cert-Template-OID',
+                      'pKIExtendedKeyUsage', 'pKIExpirationPeriod', 'pKIOverlapPeriod']
+        if include_properties:
+            properties += ['description', 'whencreated']
+        if acl:
+            properties += ['nTSecurityDescriptor']
+        pki_dn = self.get_pki_services_dn()
+        if not pki_dn:
+            return []
+        return self.search('(objectClass=pKICertificateTemplate)',
+                           properties,
+                           search_base='CN=Certificate Templates,%s' % pki_dn,
+                           generator=True,
+                           query_sd=acl)
+
+    def get_enterprise_cas(self, include_properties=False, acl=False):
+        properties = ['distinguishedName', 'name', 'objectGUID', 'cACertificate',
+                      'dNSHostName', 'certificateTemplates', 'flags']
+        if include_properties:
+            properties += ['description', 'whencreated']
+        if acl:
+            properties += ['nTSecurityDescriptor']
+        pki_dn = self.get_pki_services_dn()
+        if not pki_dn:
+            return []
+        return self.search('(objectClass=pKIEnrollmentService)',
+                           properties,
+                           search_base='CN=Enrollment Services,%s' % pki_dn,
+                           generator=True,
+                           query_sd=acl)
+
+    def get_root_cas(self, include_properties=False, acl=False):
+        properties = ['distinguishedName', 'name', 'objectGUID', 'cACertificate']
+        if include_properties:
+            properties += ['description', 'whencreated']
+        if acl:
+            properties += ['nTSecurityDescriptor']
+        pki_dn = self.get_pki_services_dn()
+        if not pki_dn:
+            return []
+        return self.search('(objectClass=certificationAuthority)',
+                           properties,
+                           search_base='CN=Certification Authorities,%s' % pki_dn,
+                           generator=True,
+                           query_sd=acl)
+
+    def get_aia_cas(self, include_properties=False, acl=False):
+        properties = ['distinguishedName', 'name', 'objectGUID', 'cACertificate',
+                      'crossCertificatePair']
+        if include_properties:
+            properties += ['description', 'whencreated']
+        if acl:
+            properties += ['nTSecurityDescriptor']
+        pki_dn = self.get_pki_services_dn()
+        if not pki_dn:
+            return []
+        return self.search('(objectClass=certificationAuthority)',
+                           properties,
+                           search_base='CN=AIA,%s' % pki_dn,
+                           generator=True,
+                           query_sd=acl)
+
+    def get_ntauth_stores(self, include_properties=False, acl=False):
+        properties = ['distinguishedName', 'name', 'objectGUID', 'cACertificate']
+        if include_properties:
+            properties += ['description', 'whencreated']
+        if acl:
+            properties += ['nTSecurityDescriptor']
+        pki_dn = self.get_pki_services_dn()
+        if not pki_dn:
+            return []
+        # The NTAuth store is a single object rather than a container, so this is
+        # a base-scoped lookup dressed up as a search to keep the return type
+        # consistent with the other getters.
+        return self.search('(objectClass=certificationAuthority)',
+                           properties,
+                           search_base=pki_dn,
+                           search_scope=LEVEL,
+                           generator=True,
+                           query_sd=acl)
+
     def prefetch_info(self, props=False, acls=False, cache_computers=False):
         self.get_objecttype()
         self.get_domains(acl=acls)
@@ -554,6 +662,18 @@ class AD(object):
         self.groups_dnmap = {} # Group mapping from gid to DN
         self.computers = {}
         self.users = {} # Users by DN
+        # Enterprise CAs discovered by the CertServices method, keyed on the
+        # lowercase DNS hostname that hosts them. The CARegistry method reads
+        # this to know which registry keys to look for on which host.
+        self.enterprise_cas = {}
+        # CARegistryData per enterprise CA object identifier, gathered from the
+        # CA hosts during computer enumeration and written out with the
+        # enterprise CA objects afterwards.
+        self.ca_registry_data = {}
+        # Local group membership delivered by Group Policy, keyed on computer
+        # SID. Merged into the computer objects when they are written out, so
+        # it covers hosts that were never reachable.
+        self.gpo_local_groups = {}
 
         # Create a resolver object
         self.dnsresolver = resolver.Resolver()

@@ -147,6 +147,29 @@ class ComputerEnumerator(MembershipEnumerator):
                     services = []
                     tasks = []
 
+                is_dc = ADUtils.is_dc(entry)
+                if 'smbinfo' in self.collect:
+                    c.host_properties.update(c.smb_get_info())
+                if 'webclientservice' in self.collect:
+                    webclient = c.check_webclient_service()
+                    if webclient is not None:
+                        c.host_properties['webclientrunning'] = webclient
+                if 'ntlmregistry' in self.collect:
+                    c.host_properties.update(c.rpc_get_ntlm_registry(is_dc=is_dc))
+                if 'dcregistry' in self.collect and is_dc:
+                    c.host_properties.update(c.rpc_get_dc_registry())
+                if 'ldapservices' in self.collect:
+                    # The registry values collected above are the better answer
+                    # where we got them, so don't let the probe overwrite one
+                    probed = c.check_ldap_services()
+                    for key, value in iteritems(probed):
+                        c.host_properties.setdefault(key, value)
+                if 'caregistry' in self.collect:
+                    cas = self.addomain.enterprise_cas.get(hostname.lower())
+                    if cas:
+                        logging.debug('Collecting CA registry data on %s', hostname)
+                        self.addomain.ca_registry_data.update(c.rpc_get_ca_registry(cas))
+
                 c.rpc_close()
                 # c.rpc_get_domain_trusts()
 

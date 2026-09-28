@@ -805,8 +805,11 @@ class MembershipEnumerator(object):
         self.enumerate_groups(timestamp)
         if 'container' in self.collect:
             self.do_container_collection(timestamp)
-        if not ('localadmin' in self.collect
-                or 'session' in self.collect
-                or 'loggedon' in self.collect
-                or 'experimental' in self.collect):
+        # Only write the computers from LDAP when nothing is going to connect
+        # to them; the computer enumerator writes the same file and would
+        # otherwise overwrite this one with a richer version of it.
+        if not any(method in self.collect for method in
+                   ('localadmin', 'session', 'loggedon', 'experimental', 'rdp', 'dcom',
+                    'psremote', 'smbinfo', 'webclientservice', 'ntlmregistry',
+                    'dcregistry', 'ldapservices', 'caregistry')):
             self.enumerate_computers_dconly(timestamp)
