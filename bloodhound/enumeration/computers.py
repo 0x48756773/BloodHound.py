@@ -82,31 +82,36 @@ class ComputerEnumerator(MembershipEnumerator):
             thread.daemon = True
             thread.start()
 
-        for _, computer in iteritems(computers):
-            if not 'attributes' in computer:
-                continue
+        # Whatever happens while queueing the work, the output file has to be
+        # closed off: without its closing metadata the JSON cannot be ingested,
+        # and every computer already written to it would be lost.
+        try:
+            for _, computer in iteritems(computers):
+                if not 'attributes' in computer:
+                    continue
 
-            # if 'dNSHostName' not in computer['attributes']:
-            #     continue
+                # if 'dNSHostName' not in computer['attributes']:
+                #     continue
 
-            hostname = ADUtils.get_entry_property(computer, 'dNSHostName')
-            samname = computer['attributes']['sAMAccountName']
-            if not hostname:
-                logging.debug('Invalid computer object without hostname: %s', samname)
-                hostname = ''
+                hostname = ADUtils.get_entry_property(computer, 'dNSHostName')
+                samname = computer['attributes']['sAMAccountName']
+                if not hostname:
+                    logging.debug('Invalid computer object without hostname: %s', samname)
+                    hostname = ''
 
-            # Check if filtering
-            if hostname in self.blocklist:
-                logging.info('Skipping computer: %s (blocklisted)', hostname)
-                continue
-            if len(self.allowlist) > 0 and hostname.lower() not in self.allowlist:
-                logging.debug('Skipping computer: %s (not allowlisted)', hostname)
-                continue
+                # Check if filtering
+                if hostname in self.blocklist:
+                    logging.info('Skipping computer: %s (blocklisted)', hostname)
+                    continue
+                if len(self.allowlist) > 0 and hostname.lower() not in self.allowlist:
+                    logging.debug('Skipping computer: %s (not allowlisted)', hostname)
+                    continue
 
-            process_queue.put((hostname, samname, computer))
-        process_queue.join()
-        result_q.put(None)
-        result_q.join()
+                process_queue.put((hostname, samname, computer))
+            process_queue.join()
+        finally:
+            result_q.put(None)
+            result_q.join()
 
     def process_computer(self, hostname, samname, objectsid, entry, results_q):
         """

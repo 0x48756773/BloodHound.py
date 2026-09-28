@@ -30,7 +30,7 @@ import json
 from uuid import UUID
 from dns import resolver
 from ldap3 import ALL_ATTRIBUTES, BASE, SUBTREE, LEVEL
-from ldap3.core.exceptions import LDAPKeyError, LDAPAttributeError, LDAPCursorError, LDAPNoSuchObjectResult, LDAPSocketReceiveError, LDAPSocketSendError
+from ldap3.core.exceptions import LDAPKeyError, LDAPAttributeError, LDAPCursorError, LDAPNoSuchObjectResult, LDAPSocketReceiveError, LDAPSocketSendError, LDAPCommunicationError
 from ldap3.protocol.microsoft import security_descriptor_control
 # from impacket.krb5.kerberosv5 import KerberosError
 from bloodhound.ad.utils import ADUtils, DNSCache, SidCache, SamCache, CollectionException
@@ -89,6 +89,9 @@ class ADDC(ADComputer):
                 logging.error('Could not find a Global Catalog in this domain!'\
                               ' Resolving will be unreliable in forests with multiple domains')
                 return False
+        # Stays None if every Global Catalog fails to resolve, which we have to
+        # check for before using it below
+        ip = None
         try:
             # Convert the hostname to an IP, this prevents ldap3 from doing it
             # which doesn't use our custom nameservers
@@ -112,9 +115,36 @@ class ADDC(ADComputer):
                 except (resolver.NXDOMAIN, resolver.Timeout):
                     continue
 
+        if ip is None:
+            logging.error('Could not resolve any Global Catalog server, resolving will be unreliable')
+            return False
+
         self.gcldap = self.ad.auth.getLDAPConnection(hostname=self.hostname, ip=ip, gc=True,
                                                      baseDN=self.ad.baseDN, protocol=protocol)
         return self.gcldap is not None
+
+    def ldap_reconnect(self, use_gc=False, use_resolver=False):
+        """
+        Re-establish the LDAP connection a failed query was using.
+
+        Which connection that is depends on the query: the Global Catalog, the
+        resolver thread's own connection, or the main one. Reconnecting the
+        wrong one leaves the retry talking to the same dead socket, so the
+        caller has to pass the same flags it used for the query.
+
+        Returns True when the connection is usable again. A failure here is
+        reported rather than raised: losing the server is not a reason to throw
+        away everything collected so far.
+        """
+        try:
+            if use_gc:
+                return self.gc_connect()
+            return self.ldap_connect(resolver=use_resolver)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            logging.error('Could not reconnect to the LDAP server: %s', exc)
+            return False
 
     def search(self, search_filter='(objectClass=*)',attributes=None, search_base=None, generator=True, use_gc=False, use_resolver=False, query_sd=False, is_retry=False,  search_scope=SUBTREE,):
         """
@@ -149,14 +179,17 @@ class ADDC(ADComputer):
                 searcher = self.ldap
 
         hadresults = False
-        sresult = searcher.extend.standard.paged_search(search_base,
-                                                        search_filter,
-                                                        attributes=attributes,
-                                                        paged_size=200,
-                                                        search_scope=search_scope,
-                                                        controls=controls,
-                                                        generator=generator)
         try:
+            # This call has to be inside the try as well: with generator=False
+            # paged_search talks to the server straight away rather than when
+            # the result is iterated, so a lost connection surfaces here.
+            sresult = searcher.extend.standard.paged_search(search_base,
+                                                            search_filter,
+                                                            attributes=attributes,
+                                                            paged_size=200,
+                                                            search_scope=search_scope,
+                                                            controls=controls,
+                                                            generator=generator)
             # Use a generator for the result regardless of if the search function uses one
             for e in sresult:
                 if e['type'] != 'searchResEntry':
@@ -167,25 +200,35 @@ class ADDC(ADComputer):
         except LDAPNoSuchObjectResult:
             # This may indicate the object doesn't exist or access is denied
             logging.warning('LDAP Server reported that the search in %s for %s does not exist.', search_base, search_filter)
-        except (LDAPSocketReceiveError, LDAPSocketSendError) as e:
+        except LDAPCommunicationError as e:
+            # Covers a reset or closed socket and a session the server tore
+            # down. All of these are transient, so reconnect and try once more
+            # rather than losing the whole collection.
             if is_retry:
                 logging.error('Connection to LDAP server lost during data gathering - reconnect failed - giving up on query %s', search_filter)
             else:
                 if hadresults:
                     logging.error('Connection to LDAP server lost during data gathering. Query was cut short. Data may be inaccurate for query %s', search_filter)
-                    self.ldap_connect(resolver=use_resolver)
+                    self.ldap_reconnect(use_gc=use_gc, use_resolver=use_resolver)
                 else:
                     logging.warning('Re-establishing connection with server')
-                    self.ldap_connect(resolver=use_resolver)
-                    # Try again
-                    yield from self.search(search_filter, attributes, search_base, generator, use_gc, use_resolver, query_sd, is_retry=True)
+                    if self.ldap_reconnect(use_gc=use_gc, use_resolver=use_resolver):
+                        # Try again
+                        yield from self.search(search_filter, attributes, search_base, generator, use_gc, use_resolver, query_sd, is_retry=True)
+                    else:
+                        logging.error('Giving up on query %s', search_filter)
 
 
-    def ldap_get_single(self, qobject, attributes=None, use_gc=False, use_resolver=False):
+    def ldap_get_single(self, qobject, attributes=None, use_gc=False, use_resolver=False, is_retry=False):
         """
         Get a single object, requires full DN to object.
         This function supports searching both in the local directory and the Global Catalog.
         The connection to the GC should already be established before calling this function.
+
+        Like search(), a lost connection is reconnected and the query retried
+        once. This is called for every unresolved group member, so on a large
+        domain it runs tens of thousands of times - letting a single reset
+        socket escape would throw away an entire collection.
         """
         if use_gc:
             searcher = self.gcldap
@@ -208,6 +251,15 @@ class ADDC(ADComputer):
             # This may indicate the object doesn't exist or access is denied
             logging.warning('LDAP Server reported that the object %s does not exist.', qobject)
             return None
+        except LDAPCommunicationError as e:
+            if is_retry:
+                logging.error('Connection to LDAP server lost while resolving %s - reconnect failed - skipping it', qobject)
+                return None
+            logging.warning('Connection to LDAP server lost while resolving %s, re-establishing it', qobject)
+            if not self.ldap_reconnect(use_gc=use_gc, use_resolver=use_resolver):
+                return None
+            return self.ldap_get_single(qobject, attributes=attributes, use_gc=use_gc,
+                                        use_resolver=use_resolver, is_retry=True)
         for e in sresult:
             if e['type'] != 'searchResEntry':
                 continue

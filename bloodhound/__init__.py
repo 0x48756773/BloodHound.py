@@ -124,8 +124,8 @@ class BloodHound(object):
                     or 'objectprops' in collect or 'acl' in collect):
                 # Nothing else is going to write computers.json in this run,
                 # and the GPO results are carried by the computer objects
-                MembershipEnumerator(self.ad, self.pdc, collect,
-                                     disable_pooling).enumerate_computers_dconly(timestamp=timestamp)
+                membership_enum = MembershipEnumerator(self.ad, self.pdc, collect, disable_pooling)
+                membership_enum.run_step(membership_enum.enumerate_computers_dconly, timestamp=timestamp)
         if do_computer_enum:
             # If we don't have a GC server, don't use it for deconflictation
             have_gc = len(self.ad.gcs()) > 0
@@ -389,13 +389,27 @@ def main():
     timestamp = datetime.datetime.fromtimestamp(time.time()).strftime('%Y%m%d%H%M%S') + "_"
     bloodhound = BloodHound(ad)
     bloodhound.connect()
-    bloodhound.run(collect=collect,
-                   num_workers=args.workers,
-                   disable_pooling=args.disable_pooling,
-                   timestamp=timestamp,
-                   computerfile=args.computerfile,
-                   cachefile=args.cachefile,
-                   exclude_dcs=args.exclude_dcs)
+    try:
+        bloodhound.run(collect=collect,
+                       num_workers=args.workers,
+                       disable_pooling=args.disable_pooling,
+                       timestamp=timestamp,
+                       computerfile=args.computerfile,
+                       cachefile=args.cachefile,
+                       exclude_dcs=args.exclude_dcs)
+    except KeyboardInterrupt:
+        logging.warning('Interrupted, the files written so far are complete but the collection is not')
+        sys.exit(1)
+    except Exception as exc:
+        # A collection can run for hours, so report what went wrong and point
+        # at the partial output rather than only printing a traceback. Each
+        # enumeration step closes its own output file, so the files for the
+        # steps that did finish are valid and can be imported.
+        logging.error('Collection failed: %s', exc)
+        logging.info('Traceback:', exc_info=True)
+        logging.error('The output files written before the failure are complete and can be imported. '
+                      'Files for steps that did not run are missing.')
+        sys.exit(1)
     #If args --zip is true, the compress output  
     if args.zip:
         logging.info("Compressing output into " + timestamp + "bloodhound.zip")
