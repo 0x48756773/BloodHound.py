@@ -76,6 +76,9 @@ class CertificateServicesEnumerator(object):
         self.template_guids = {}
         # Cache for DNS hostname -> computer SID lookups
         self.hostname_sids = {}
+        # Whether the current output file has been closed off. Starts True
+        # because there is no output file open yet.
+        self.output_finalized = True
 
     def process_acldata(self, result):
         """
@@ -88,6 +91,7 @@ class CertificateServicesEnumerator(object):
 
     def start_writer(self, enumtype, filename):
         self.result_q = queue.Queue()
+        self.output_finalized = False
         results_worker = threading.Thread(target=OutputWorker.membership_write_worker,
                                           args=(self.result_q, enumtype, filename))
         results_worker.daemon = True
@@ -95,11 +99,34 @@ class CertificateServicesEnumerator(object):
         return results_worker
 
     def finish(self, acl):
-        if acl and not self.disable_pooling:
-            self.aclenumerator.pool.close()
-            self.aclenumerator.pool.join()
+        """
+        Shut down the ACL pool and close off the current output file.
+
+        Idempotent, so it can also be called from a finally block after the
+        normal path already ran: a second None on the queue would never be
+        consumed and the join below would block forever.
+        """
+        if self.output_finalized:
+            return
+        self.output_finalized = True
+        if acl and not self.disable_pooling and self.aclenumerator.pool is not None:
+            try:
+                self.aclenumerator.pool.close()
+                self.aclenumerator.pool.join()
+            except Exception as exc:
+                logging.debug('Error while shutting down the ACL pool: %s', exc)
         self.result_q.put(None)
         self.result_q.join()
+
+    def run_step(self, step, *args, **kwargs):
+        """
+        Run one enumeration step, making sure its output file is closed off
+        even when the step raises.
+        """
+        try:
+            step(*args, **kwargs)
+        finally:
+            self.finish('acl' in self.collect)
 
     def queue_object(self, data, entrytype, entry, acl):
         """
@@ -453,8 +480,8 @@ class CertificateServicesEnumerator(object):
             logging.warning('Could not locate the Public Key Services container, skipping CertServices')
             return
         logging.info('Collecting AD CS objects')
-        self.enumerate_cert_templates(timestamp)
-        self.enumerate_enterprise_cas(timestamp)
-        self.enumerate_ca_store(self.addc.get_root_cas, 'rootcas', 'rootca', 'rootcas.json', timestamp)
-        self.enumerate_ca_store(self.addc.get_aia_cas, 'aiacas', 'aiaca', 'aiacas.json', timestamp)
-        self.enumerate_ca_store(self.addc.get_ntauth_stores, 'ntauthstores', 'ntauthstore', 'ntauthstores.json', timestamp)
+        self.run_step(self.enumerate_cert_templates, timestamp)
+        self.run_step(self.enumerate_enterprise_cas, timestamp)
+        self.run_step(self.enumerate_ca_store, self.addc.get_root_cas, 'rootcas', 'rootca', 'rootcas.json', timestamp)
+        self.run_step(self.enumerate_ca_store, self.addc.get_aia_cas, 'aiacas', 'aiaca', 'aiacas.json', timestamp)
+        self.run_step(self.enumerate_ca_store, self.addc.get_ntauth_stores, 'ntauthstores', 'ntauthstore', 'ntauthstores.json', timestamp)

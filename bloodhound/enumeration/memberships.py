@@ -50,6 +50,44 @@ class MembershipEnumerator(object):
         self.aclenumerator = AclEnumerator(addomain, addc, collect)
         self.aceresolver = AceResolver(addomain, addomain.objectresolver)
         self.result_q = None
+        # Whether the current output file has been closed off. Starts True
+        # because there is no output file open yet.
+        self.output_finalized = True
+
+    def finalize_output(self, acl=False):
+        """
+        Shut down the ACL pool and close off the output file of the enumeration
+        step that just ran.
+
+        Idempotent on purpose, so it is safe to call from a finally block after
+        the normal path has already run: a second None on the queue would never
+        be consumed and the join below would block forever.
+        """
+        if self.output_finalized:
+            return
+        self.output_finalized = True
+        if acl and not self.disable_pooling and self.aclenumerator.pool is not None:
+            try:
+                self.aclenumerator.pool.close()
+                self.aclenumerator.pool.join()
+            except Exception as exc:
+                logging.debug('Error while shutting down the ACL pool: %s', exc)
+        self.result_q.put(None)
+        self.result_q.join()
+
+    def run_step(self, step, *args, **kwargs):
+        """
+        Run one enumeration step, making sure its output file is closed even
+        when the step raises.
+
+        A JSON file that never got its closing metadata cannot be ingested at
+        all, so without this a failure partway through one step would cost
+        every object already written to that file.
+        """
+        try:
+            step(*args, **kwargs)
+        finally:
+            self.finalize_output('acl' in self.collect)
 
     def get_membership(self, member):
         """
@@ -131,6 +169,7 @@ class MembershipEnumerator(object):
 
         # Use a separate queue for processing the results
         self.result_q = queue.Queue()
+        self.output_finalized = False
         results_worker = threading.Thread(target=OutputWorker.membership_write_worker, args=(self.result_q, 'users', filename))
         results_worker.daemon = True
         results_worker.start()
@@ -214,13 +253,7 @@ class MembershipEnumerator(object):
 
         # If we are parsing ACLs, close the parsing pool first
         # then close the result queue and join it
-        if acl and not self.disable_pooling:
-            self.aclenumerator.pool.close()
-            self.aclenumerator.pool.join()
-            self.result_q.put(None)
-        else:
-            self.result_q.put(None)
-        self.result_q.join()
+        self.finalize_output(acl)
 
         logging.debug('Finished writing users')
 
@@ -246,6 +279,7 @@ class MembershipEnumerator(object):
 
         # Use a separate queue for processing the results
         self.result_q = queue.Queue()
+        self.output_finalized = False
         results_worker = threading.Thread(target=OutputWorker.membership_write_worker, args=(self.result_q, 'groups', filename))
         results_worker.daemon = True
         results_worker.start()
@@ -314,13 +348,7 @@ class MembershipEnumerator(object):
 
         # If we are parsing ACLs, close the parsing pool first
         # then close the result queue and join it
-        if acl and not self.disable_pooling:
-            self.aclenumerator.pool.close()
-            self.aclenumerator.pool.join()
-            self.result_q.put(None)
-        else:
-            self.result_q.put(None)
-        self.result_q.join()
+        self.finalize_output(acl)
 
         logging.debug('Finished writing groups')
 
@@ -341,6 +369,7 @@ class MembershipEnumerator(object):
 
         # Use a separate queue for processing the results
         self.result_q = queue.Queue()
+        self.output_finalized = False
         results_worker = threading.Thread(target=OutputWorker.membership_write_worker, args=(self.result_q, 'computers', filename))
         results_worker.daemon = True
         results_worker.start()
@@ -379,13 +408,7 @@ class MembershipEnumerator(object):
 
         # If we are parsing ACLs, close the parsing pool first
         # then close the result queue and join it
-        if acl and not self.disable_pooling:
-            self.aclenumerator.pool.close()
-            self.aclenumerator.pool.join()
-            self.result_q.put(None)
-        else:
-            self.result_q.put(None)
-        self.result_q.join()
+        self.finalize_output(acl)
 
         logging.debug('Finished writing computers')
 
@@ -400,6 +423,7 @@ class MembershipEnumerator(object):
 
         # Use a separate queue for processing the results
         self.result_q = queue.Queue()
+        self.output_finalized = False
         results_worker = threading.Thread(target=OutputWorker.membership_write_worker, args=(self.result_q, 'gpos', filename))
         results_worker.daemon = True
         results_worker.start()
@@ -460,13 +484,7 @@ class MembershipEnumerator(object):
 
         # If we are parsing ACLs, close the parsing pool first
         # then close the result queue and join it
-        if acl and not self.disable_pooling:
-            self.aclenumerator.pool.close()
-            self.aclenumerator.pool.join()
-            self.result_q.put(None)
-        else:
-            self.result_q.put(None)
-        self.result_q.join()
+        self.finalize_output(acl)
 
         logging.debug('Finished writing GPO')
 
@@ -480,6 +498,7 @@ class MembershipEnumerator(object):
 
         # Use a separate queue for processing the results
         self.result_q = queue.Queue()
+        self.output_finalized = False
         results_worker = threading.Thread(target=OutputWorker.membership_write_worker, args=(self.result_q, 'ous', filename))
         results_worker.daemon = True
         results_worker.start()
@@ -567,13 +586,7 @@ class MembershipEnumerator(object):
 
         # If we are parsing ACLs, close the parsing pool first
         # then close the result queue and join it
-        if acl and not self.disable_pooling:
-            self.aclenumerator.pool.close()
-            self.aclenumerator.pool.join()
-            self.result_q.put(None)
-        else:
-            self.result_q.put(None)
-        self.result_q.join()
+        self.finalize_output(acl)
 
         logging.debug('Finished writing OU')
 
@@ -587,6 +600,7 @@ class MembershipEnumerator(object):
 
         # Use a separate queue for processing the results
         self.result_q = queue.Queue()
+        self.output_finalized = False
         results_worker = threading.Thread(target=OutputWorker.membership_write_worker, args=(self.result_q, 'containers', filename))
         results_worker.daemon = True
         results_worker.start()
@@ -658,13 +672,7 @@ class MembershipEnumerator(object):
 
         # If we are parsing ACLs, close the parsing pool first
         # then close the result queue and join it
-        if acl and not self.disable_pooling:
-            self.aclenumerator.pool.close()
-            self.aclenumerator.pool.join()
-            self.result_q.put(None)
-        else:
-            self.result_q.put(None)
-        self.result_q.join()
+        self.finalize_output(acl)
 
         logging.debug('Finished writing containers')
 
@@ -793,16 +801,16 @@ class MembershipEnumerator(object):
         self.result_q.put(iugroup)
 
     def do_container_collection(self, timestamp=""):
-        self.enumerate_gpos(timestamp)
-        self.enumerate_ous(timestamp)
-        self.enumerate_containers(timestamp)
+        self.run_step(self.enumerate_gpos, timestamp)
+        self.run_step(self.enumerate_ous, timestamp)
+        self.run_step(self.enumerate_containers, timestamp)
 
     def enumerate_memberships(self, timestamp=""):
         """
         Run appropriate enumeration tasks
         """
-        self.enumerate_users(timestamp)
-        self.enumerate_groups(timestamp)
+        self.run_step(self.enumerate_users, timestamp)
+        self.run_step(self.enumerate_groups, timestamp)
         if 'container' in self.collect:
             self.do_container_collection(timestamp)
         # Only write the computers from LDAP when nothing is going to connect
@@ -812,4 +820,4 @@ class MembershipEnumerator(object):
                    ('localadmin', 'session', 'loggedon', 'experimental', 'rdp', 'dcom',
                     'psremote', 'smbinfo', 'webclientservice', 'ntlmregistry',
                     'dcregistry', 'ldapservices', 'caregistry')):
-            self.enumerate_computers_dconly(timestamp)
+            self.run_step(self.enumerate_computers_dconly, timestamp)
