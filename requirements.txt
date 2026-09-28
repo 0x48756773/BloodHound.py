@@ -1,0 +1,26 @@
+# Runtime dependencies for running BloodHound.py from a checkout:
+#
+#     pip install -r requirements.txt
+#
+# Installing the package instead (pip install . / pip install bloodhound) reads
+# install_requires in setup.py, not this file, so the two lists have to be kept
+# in step with each other.
+#
+# The constraints below are the ones setup.py declares. The trailing comments
+# record the versions this was last verified against, which is a working set
+# rather than the only one.
+#
+# The test suite needs nothing beyond these and the standard library:
+#
+#     python -m unittest discover -s tests
+
+dnspython                          # verified with 2.8.0
+impacket>=0.9.17                   # verified with 0.13.1
+ldap3>=2.5,!=2.5.2,!=2.5.0,!=2.6   # verified with 2.9.1
+pyasn1>=0.4                        # verified with 0.6.4
+future                             # verified with 1.0.0
+cryptography                       # verified with 50.0.1; reads the certificates CertServices collects
+
+# Not listed on purpose: impacket pulls in its own crypto dependency
+# (pycryptodomex on current versions), so pinning one here only risks
+# conflicting with whichever impacket release is installed.
