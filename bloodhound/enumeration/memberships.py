@@ -205,18 +205,9 @@ class MembershipEnumerator(object):
             if with_properties:
                 MembershipEnumerator.add_user_properties(user, entry)
                 if 'allowedtodelegate' in user['Properties']:
-                    for host in user['Properties']['allowedtodelegate']:
-                        try:
-                            target = host.split('/')[1]
-                        except IndexError:
-                            logging.warning('Invalid delegation target: %s', host)
-                            continue
-                        try:
-                            sid = self.addomain.computersidcache.get(target.lower())
-                            user['AllowedToDelegate'].append(sid)
-                        except KeyError:
-                            if '.' in target:
-                                user['AllowedToDelegate'].append(target.upper())
+                    user['AllowedToDelegate'] = ADUtils.resolve_delegation_targets(
+                        user['Properties']['allowedtodelegate'],
+                        self.addomain.computersidcache)
                 # Parse SID history
                 if len(user['Properties']['sidhistory']) > 0:
                     for historysid in user['Properties']['sidhistory']:

@@ -124,6 +124,38 @@ class ADUtils(object):
     def ldap2domain(ldap):
         return re.sub(',DC=', '.', ldap[ldap.find('DC='):], flags=re.I)[3:]
 
+    @staticmethod
+    def resolve_delegation_targets(spns, computersidcache):
+        """
+        Turn the SPNs in msDS-AllowedToDelegateTo into BloodHound principals.
+
+        Each entry is an SPN such as "HOST/server.domain.local", whose host
+        part names the computer the account may delegate to. Where that host is
+        in the computer cache we emit its SID; where it is not, we fall back to
+        the uppercased FQDN, which BloodHound resolves on ingest.
+
+        These have to be objects with an ObjectIdentifier and an ObjectType,
+        not bare strings: BloodHound reads the field as a typed principal and
+        rejects the whole file otherwise.
+        """
+        targets = []
+        for spn in spns or []:
+            try:
+                host = spn.split('/')[1]
+            except IndexError:
+                logging.warning('Invalid delegation target: %s', spn)
+                continue
+            try:
+                identifier = computersidcache.get(host.lower())
+            except KeyError:
+                if '.' not in host:
+                    # A NetBIOS name we could not map to a computer; emitting it
+                    # would claim delegation to something unidentifiable
+                    continue
+                identifier = host.upper()
+            targets.append({'ObjectIdentifier': identifier, 'ObjectType': 'Computer'})
+        return targets
+
 
     @staticmethod
     def tcp_ping(host, port, timeout=1.0):
