@@ -207,18 +207,8 @@ class ADComputer(object):
                 props['operatingsystem'] = '%s %s' % (props['operatingsystem'], servicepack)
             props['sidhistory'] = [LDAP_SID(bsid).formatCanonical() for bsid in ADUtils.get_entry_property(entry, 'sIDHistory', [])]
             delegatehosts = ADUtils.get_entry_property(entry, 'msDS-AllowedToDelegateTo', [])
-            for host in delegatehosts:
-                try:
-                    target = host.split('/')[1]
-                except IndexError:
-                    logging.warning('Invalid delegation target: %s', host)
-                    continue
-                try:
-                    sid = self.ad.computersidcache.get(target.lower())
-                    data['AllowedToDelegate'].append(sid)
-                except KeyError:
-                    if '.' in target:
-                        data['AllowedToDelegate'].append(target.upper())
+            data['AllowedToDelegate'] = ADUtils.resolve_delegation_targets(delegatehosts,
+                                                                           self.ad.computersidcache)
             if len(delegatehosts) > 0:
                 props['allowedtodelegate'] = delegatehosts
 
