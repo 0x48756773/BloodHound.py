@@ -233,3 +233,158 @@ class TestRepairFiles(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def certtemplates_document(*identifiers):
+    return {
+        'data': [{'ObjectIdentifier': i,
+                  'Properties': {'name': '%s@CORP.LOCAL' % i, 'domainsid': 'S-1-5-21-1-2-3'},
+                  'Aces': []} for i in identifiers],
+        'meta': {'methods': 0, 'type': 'certtemplates', 'count': len(identifiers), 'version': 5},
+    }
+
+
+def enterprisecas_document(published=(), domainsid='S-1-5-21-1-2-3'):
+    return {
+        'data': [{'ObjectIdentifier': 'CA-1',
+                  'Properties': {'name': 'ISSUING-CA@CORP.LOCAL', 'domainsid': domainsid,
+                                 'certthumbprint': 'ABC123'},
+                  'EnabledCertTemplates': [{'ObjectIdentifier': i, 'ObjectType': 'CertTemplate'}
+                                           for i in published],
+                  'Aces': []}],
+        'meta': {'methods': 0, 'type': 'enterprisecas', 'count': 1, 'version': 5},
+    }
+
+
+def ntauthstores_document(thumbprints=('ABC123',)):
+    return {
+        'data': [{'ObjectIdentifier': 'NTAUTH-1', 'DomainSID': 'S-1-5-21-1-2-3',
+                  'Properties': {'name': 'NTAUTHCERTIFICATES@CORP.LOCAL'},
+                  'CertThumbprints': list(thumbprints), 'Aces': []}],
+        'meta': {'methods': 0, 'type': 'ntauthstores', 'count': 1, 'version': 5},
+    }
+
+
+class TestAdcsRepair(unittest.TestCase):
+    """
+    The AD CS properties BloodHound gates the certificate paths on were never
+    collected, but all three are derivable from what is already in the files,
+    so an affected collection does not have to be re-run.
+    """
+    def test_enabled_follows_what_the_cas_publish(self):
+        templates = certtemplates_document('T-1', 'T-2')
+        context = repair_output.collect_context([enterprisecas_document(published=['T-1'])])
+
+        self.assertEqual(repair_output.repair_document(templates, context), 2)
+        self.assertTrue(templates['data'][0]['Properties']['enabled'])
+        self.assertFalse(templates['data'][1]['Properties']['enabled'],
+                         'a template no CA publishes is not enabled')
+
+    def test_enabled_match_is_case_insensitive_on_the_guid(self):
+        templates = certtemplates_document('aaaa-bbbb')
+        context = repair_output.collect_context([enterprisecas_document(published=['AAAA-BBBB'])])
+        repair_output.repair_document(templates, context)
+        self.assertTrue(templates['data'][0]['Properties']['enabled'])
+
+    def test_an_existing_enabled_value_is_left_alone(self):
+        templates = certtemplates_document('T-1')
+        templates['data'][0]['Properties']['enabled'] = True
+        # T-1 is not published, but the collected value wins over our inference
+        context = repair_output.collect_context([enterprisecas_document(published=[])])
+        self.assertEqual(repair_output.repair_document(templates, context), 0)
+        self.assertTrue(templates['data'][0]['Properties']['enabled'])
+
+    def test_templates_are_not_marked_disabled_without_the_ca_file(self):
+        # Guessing "disabled" for everything would be worse than leaving it
+        # absent, since it reads as a deliberate finding
+        templates = certtemplates_document('T-1')
+        self.assertEqual(repair_output.repair_document(templates, None), 0)
+        self.assertNotIn('enabled', templates['data'][0]['Properties'])
+
+    def test_ntauth_thumbprints_are_copied_into_properties(self):
+        store = ntauthstores_document(['ABC123', 'DEF456'])
+        self.assertEqual(repair_output.repair_document(store, {}), 1)
+        self.assertEqual(store['data'][0]['Properties']['certthumbprints'], ['ABC123', 'DEF456'])
+        # The top-level copy is left in place
+        self.assertEqual(store['data'][0]['CertThumbprints'], ['ABC123', 'DEF456'])
+
+    def test_ntauth_repair_is_idempotent(self):
+        store = ntauthstores_document()
+        repair_output.repair_document(store, {})
+        self.assertEqual(repair_output.repair_document(store, {}), 0)
+
+    def test_ntauth_without_thumbprints_is_left_alone(self):
+        store = ntauthstores_document()
+        del store['data'][0]['CertThumbprints']
+        self.assertEqual(repair_output.repair_document(store, {}), 0)
+        self.assertNotIn('certthumbprints', store['data'][0]['Properties'])
+
+    def test_enterprise_ca_domain_sid_is_backfilled(self):
+        cas = enterprisecas_document()
+        self.assertEqual(repair_output.repair_document(cas, {}), 1)
+        self.assertEqual(cas['data'][0]['DomainSID'], 'S-1-5-21-1-2-3')
+
+    def test_enterprise_ca_without_a_domainsid_property_is_left_alone(self):
+        cas = enterprisecas_document()
+        del cas['data'][0]['Properties']['domainsid']
+        self.assertEqual(repair_output.repair_document(cas, {}), 0)
+        self.assertNotIn('DomainSID', cas['data'][0])
+
+    def test_other_collection_types_are_untouched_by_the_adcs_repairs(self):
+        users = broken_document()
+        before_keys = set(users['data'][0])
+        repair_output.repair_document(users, {})
+        self.assertEqual(set(users['data'][0]), before_keys)
+
+
+class TestAdcsRepairAcrossFiles(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def write(self, name, document):
+        path = os.path.join(self.tmpdir, name)
+        with open(path, 'w') as handle:
+            json.dump(document, handle)
+        return path
+
+    def test_build_context_reads_the_ca_file_from_the_set(self):
+        self.write('certtemplates.json', certtemplates_document('T-1'))
+        ca_path = self.write('enterprisecas.json', enterprisecas_document(published=['T-1']))
+        template_path = os.path.join(self.tmpdir, 'certtemplates.json')
+
+        context = repair_output.build_context([template_path, ca_path])
+        self.assertEqual(context['enabled_templates'], {'T-1'})
+
+        repair_output.repair_json_file(template_path, context=context)
+        with open(template_path) as handle:
+            self.assertTrue(json.load(handle)['data'][0]['Properties']['enabled'])
+
+    def test_build_context_tolerates_unreadable_files(self):
+        good = self.write('enterprisecas.json', enterprisecas_document(published=['T-1']))
+        bad = os.path.join(self.tmpdir, 'truncated.json')
+        with open(bad, 'w') as handle:
+            handle.write('{"data":[')
+        # The broken file is reported when it is repaired, not here
+        self.assertEqual(repair_output.build_context([bad, good])['enabled_templates'], {'T-1'})
+
+    def test_zip_resolves_context_from_its_own_members(self):
+        path = os.path.join(self.tmpdir, 'bloodhound.zip')
+        with zipfile.ZipFile(path, 'w') as archive:
+            archive.writestr('certtemplates.json', json.dumps(certtemplates_document('T-1', 'T-2')))
+            archive.writestr('enterprisecas.json',
+                             json.dumps(enterprisecas_document(published=['T-1'])))
+            archive.writestr('ntauthstores.json', json.dumps(ntauthstores_document()))
+
+        self.assertTrue(repair_output.repair_zip_file(path) > 0)
+
+        with zipfile.ZipFile(path) as archive:
+            templates = json.loads(archive.read('certtemplates.json').decode('utf-8'))
+            self.assertTrue(templates['data'][0]['Properties']['enabled'])
+            self.assertFalse(templates['data'][1]['Properties']['enabled'])
+            store = json.loads(archive.read('ntauthstores.json').decode('utf-8'))
+            self.assertIn('certthumbprints', store['data'][0]['Properties'])
+            cas = json.loads(archive.read('enterprisecas.json').decode('utf-8'))
+            self.assertEqual(cas['data'][0]['DomainSID'], 'S-1-5-21-1-2-3')
