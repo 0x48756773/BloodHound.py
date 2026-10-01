@@ -74,6 +74,11 @@ class CertificateServicesEnumerator(object):
         # enumerated and used afterwards to resolve the template names a CA
         # publishes into the GUIDs BloodHound links against.
         self.template_guids = {}
+        # Lowercased names of every template published by at least one
+        # enterprise CA. A template that no CA publishes cannot be enrolled
+        # from, which is what BloodHound's 'enabled' property means, so this
+        # has to be known before the templates themselves are written out.
+        self.published_templates = set()
         # Cache for DNS hostname -> computer SID lookups
         self.hostname_sids = {}
         # Whether the current output file has been closed off. Starts True
@@ -264,7 +269,12 @@ class CertificateServicesEnumerator(object):
             displayname = ADUtils.get_entry_property(entry, 'displayName')
             props = self.base_properties(entry, with_properties,
                                          name=displayname or ADUtils.get_entry_property(entry, 'name', ''))
+            # A CA can publish a template under either its CN or its display
+            # name depending on the template's schema version, so match on both
+            cn = ADUtils.get_entry_property(entry, 'name', '')
             props.update({
+                'enabled': any(candidate and candidate.lower() in self.published_templates
+                               for candidate in (cn, displayname)),
                 'displayname': displayname,
                 'validityperiod': filetime_to_span(
                     ADUtils.get_entry_property(entry, 'pKIExpirationPeriod', raw=True)),
@@ -361,6 +371,10 @@ class CertificateServicesEnumerator(object):
             enterpriseca = {
                 'ObjectIdentifier': guid,
                 'Properties': props,
+                # Links the CA to its domain. The root CA and NTAuth store
+                # objects carry this too; without it the CA is not tied to the
+                # domain it issues for.
+                'DomainSID': self.addomain.domain_object.sid,
                 'HostingComputer': self.resolve_hosting_computer(dnshostname),
                 'EnabledCertTemplates': enabled,
                 # Gathered by the CARegistry method during computer enumeration,
@@ -424,6 +438,12 @@ class CertificateServicesEnumerator(object):
                     parsed = parse_certificate(certificate)
                     if parsed['thumbprint']:
                         thumbprints.append(parsed['thumbprint'])
+                # BloodHound matches an enterprise CA's certthumbprint against
+                # this list to decide whether the CA is trusted for NT
+                # authentication, and every certificate escalation path runs
+                # through that trust. It reads it as a node property, so the
+                # top-level copy alone is not enough.
+                props['certthumbprints'] = thumbprints
                 data['CertThumbprints'] = thumbprints
             else:
                 self.add_certificate_properties(props, entry)
@@ -446,6 +466,26 @@ class CertificateServicesEnumerator(object):
 
         self.finish(acl)
         logging.debug('Finished writing %s', enumtype)
+
+    def prefetch_published_templates(self):
+        """
+        Record which templates the enterprise CAs publish.
+
+        BloodHound treats a template as enabled when a CA offers it for
+        enrollment, and will not consider a disabled one for any of the
+        certificate escalation paths. The CA objects are written after the
+        templates - they reference templates by name and need the GUID map -
+        so this reads just the certificateTemplates attribute up front.
+        """
+        for entry in self.addc.get_enterprise_cas():
+            published = ADUtils.get_entry_property(entry, 'certificateTemplates', [])
+            if isinstance(published, str):
+                published = [published]
+            for name in published:
+                if name:
+                    self.published_templates.add(name.lower())
+        logging.debug('Found %d distinct published certificate template name(s)',
+                      len(self.published_templates))
 
     def prefetch_ca_hosts(self):
         """
@@ -480,6 +520,9 @@ class CertificateServicesEnumerator(object):
             logging.warning('Could not locate the Public Key Services container, skipping CertServices')
             return
         logging.info('Collecting AD CS objects')
+        # Which templates the CAs publish decides the enabled flag on each
+        # template, so this has to happen before they are written
+        self.prefetch_published_templates()
         self.run_step(self.enumerate_cert_templates, timestamp)
         self.run_step(self.enumerate_enterprise_cas, timestamp)
         self.run_step(self.enumerate_ca_store, self.addc.get_root_cas, 'rootcas', 'rootca', 'rootcas.json', timestamp)
