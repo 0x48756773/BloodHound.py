@@ -158,3 +158,237 @@ class TestComputerDelegationOutput(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def cert_template_entry(guid, name, displayname, name_flag=0, enrollment_flag=0,
+                        schemaversion=2, ekus=None):
+    return {
+        'attributes': {
+            'objectGUID': '{%s}' % guid,
+            'name': name,
+            'displayName': displayname,
+            'distinguishedName': 'CN=%s,CN=Certificate Templates,CN=Public Key Services,'
+                                 'CN=Services,CN=Configuration,DC=CORP,DC=LOCAL' % name,
+            'msPKI-Certificate-Name-Flag': name_flag,
+            'msPKI-Enrollment-Flag': enrollment_flag,
+            'msPKI-Template-Schema-Version': schemaversion,
+            'msPKI-Cert-Template-OID': '1.3.6.1.4.1.311.21.8.1.2.3',
+            'msPKI-RA-Signature': 0,
+            'pKIExtendedKeyUsage': ekus if ekus is not None else [],
+            'msPKI-Certificate-Application-Policy': [],
+            'msPKI-RA-Application-Policies': [],
+        },
+        'raw_attributes': {},
+    }
+
+
+class CapturingCertEnumerator(object):
+    """
+    Runs the certificate enumerator against synthetic LDAP entries and keeps
+    the objects it would have written, so the emitted properties can be checked
+    without a directory or an output file.
+    """
+    def __init__(self, entries, published=(), ca_entries=()):
+        import queue as queue_module
+        from bloodhound.enumeration.certificates import CertificateServicesEnumerator
+
+        self.captured = []
+        enumerator = CertificateServicesEnumerator.__new__(CertificateServicesEnumerator)
+        enumerator.collect = set()
+        enumerator.disable_pooling = True
+        enumerator.aclenumerator = types.SimpleNamespace(pool=None)
+        enumerator.aceresolver = None
+        enumerator.result_q = None
+        enumerator.output_finalized = True
+        enumerator.template_guids = {}
+        enumerator.published_templates = set(name.lower() for name in published)
+        enumerator.hostname_sids = {}
+        enumerator.addomain = types.SimpleNamespace(
+            domain='corp.local',
+            domain_object=types.SimpleNamespace(sid='S-1-5-21-1-2-3'),
+            dncache={},
+            ca_registry_data={},
+            computersidcache=SidCache())
+        enumerator.addc = types.SimpleNamespace(
+            objecttype_guid_map={},
+            get_cert_templates=lambda include_properties=False, acl=False: entries,
+            get_enterprise_cas=lambda include_properties=False, acl=False: ca_entries,
+            get_ntauth_stores=lambda include_properties=False, acl=False: entries,
+            search=lambda *a, **kw: [])
+
+        captured = self.captured
+
+        def start_writer(enumtype, filename):
+            enumerator.result_q = queue_module.Queue()
+            enumerator.output_finalized = False
+            return None
+
+        def finish(acl):
+            enumerator.output_finalized = True
+            while not enumerator.result_q.empty():
+                captured.append(enumerator.result_q.get())
+
+        enumerator.start_writer = start_writer
+        enumerator.finish = finish
+        self.enumerator = enumerator
+
+
+class TestCertTemplateProperties(unittest.TestCase):
+    """
+    BloodHound gates the certificate escalation paths on these properties by
+    name. A missing one is not a visible error - the templates import fine and
+    simply never produce an edge - so the names and the enabled flag are worth
+    asserting.
+    """
+    # Names BloodHound reads off a CertTemplate node
+    REQUIRED = (
+        'enabled', 'requiresmanagerapproval', 'authenticationenabled',
+        'enrolleesuppliessubject', 'schemaversion', 'authorizedsignatures',
+        'nosecurityextension', 'subjectaltrequireupn', 'subjectaltrequiredns',
+        'subjectaltrequiredomaindns', 'subjectaltrequireemail', 'subjectaltrequirespn',
+        'subjectrequireemail', 'ekus', 'effectiveekus', 'certificatenameflag',
+        'enrollmentflag', 'certificateapplicationpolicy', 'applicationpolicies',
+        'oid', 'validityperiod', 'renewalperiod', 'schannelauthenticationenabled',
+    )
+
+    def run_templates(self, entries, published=()):
+        harness = CapturingCertEnumerator(entries, published=published)
+        harness.enumerator.enumerate_cert_templates()
+        return harness.captured
+
+    def test_every_property_bloodhound_reads_is_present(self):
+        templates = self.run_templates(
+            [cert_template_entry('AAAAAAAA-0000-0000-0000-000000000001', 'WebServer', 'Web Server')])
+        self.assertEqual(len(templates), 1)
+        for name in self.REQUIRED:
+            self.assertIn(name, templates[0]['Properties'],
+                          '%s is read by BloodHound and must be emitted' % name)
+
+    def test_enabled_is_true_when_a_ca_publishes_the_template(self):
+        templates = self.run_templates(
+            [cert_template_entry('AAAAAAAA-0000-0000-0000-000000000001', 'WebServer', 'Web Server')],
+            published=['WebServer'])
+        self.assertTrue(templates[0]['Properties']['enabled'])
+
+    def test_enabled_matches_on_the_display_name_too(self):
+        # Which of the two a CA lists depends on the template's schema version
+        templates = self.run_templates(
+            [cert_template_entry('AAAAAAAA-0000-0000-0000-000000000001', 'WebServer', 'Web Server')],
+            published=['Web Server'])
+        self.assertTrue(templates[0]['Properties']['enabled'])
+
+    def test_enabled_is_false_when_no_ca_publishes_it(self):
+        templates = self.run_templates(
+            [cert_template_entry('AAAAAAAA-0000-0000-0000-000000000001', 'WebServer', 'Web Server')],
+            published=['SomethingElse'])
+        self.assertFalse(templates[0]['Properties']['enabled'])
+
+    def test_esc1_relevant_flags_decode_from_the_name_flag(self):
+        # 0x1 is CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT, which ESC1 requires
+        templates = self.run_templates(
+            [cert_template_entry('AAAAAAAA-0000-0000-0000-000000000001', 'Offline', 'Offline',
+                                 name_flag=0x00000001,
+                                 ekus=['1.3.6.1.5.5.7.3.2'])],
+            published=['Offline'])
+        props = templates[0]['Properties']
+        self.assertTrue(props['enrolleesuppliessubject'])
+        self.assertTrue(props['authenticationenabled'])
+        self.assertFalse(props['requiresmanagerapproval'])
+        self.assertEqual(props['authorizedsignatures'], 0)
+
+    def test_name_flag_with_the_high_bit_set_still_decodes(self):
+        # AD stores this as a signed 32-bit integer, so a template requiring a
+        # subject from AD arrives as a negative number
+        templates = self.run_templates(
+            [cert_template_entry('AAAAAAAA-0000-0000-0000-000000000001', 'User', 'User',
+                                 name_flag=-1375731712)])
+        props = templates[0]['Properties']
+        self.assertTrue(props['subjectaltrequireupn'])
+        self.assertFalse(props['enrolleesuppliessubject'])
+
+    def test_manager_approval_decodes_from_the_enrollment_flag(self):
+        templates = self.run_templates(
+            [cert_template_entry('AAAAAAAA-0000-0000-0000-000000000001', 'T', 'T',
+                                 enrollment_flag=0x00000002)])
+        self.assertTrue(templates[0]['Properties']['requiresmanagerapproval'])
+
+
+class TestNTAuthStoreProperties(unittest.TestCase):
+    def test_thumbprints_are_emitted_as_a_node_property(self):
+        """
+        BloodHound matches an enterprise CA's certthumbprint against this list
+        to build the NT auth trust that every certificate path runs through,
+        and it reads it as a node property.
+        """
+        harness = CapturingCertEnumerator(
+            [cert_template_entry('BBBBBBBB-0000-0000-0000-000000000001',
+                                 'NTAuthCertificates', 'NTAuthCertificates')])
+        harness.enumerator.enumerate_ca_store(
+            harness.enumerator.addc.get_ntauth_stores,
+            'ntauthstores', 'ntauthstore', 'ntauthstores.json')
+
+        self.assertEqual(len(harness.captured), 1)
+        store = harness.captured[0]
+        self.assertIn('certthumbprints', store['Properties'])
+        self.assertIsInstance(store['Properties']['certthumbprints'], list)
+        # Kept at the top level as well, which is where SharpHound puts it
+        self.assertIn('CertThumbprints', store)
+        self.assertEqual(store['Properties']['certthumbprints'], store['CertThumbprints'])
+        self.assertEqual(store['DomainSID'], 'S-1-5-21-1-2-3')
+
+
+def enterprise_ca_entry(guid, name, dnshostname, templates=()):
+    return {
+        'attributes': {
+            'objectGUID': '{%s}' % guid,
+            'name': name,
+            'dNSHostName': dnshostname,
+            'distinguishedName': 'CN=%s,CN=Enrollment Services,CN=Public Key Services,'
+                                 'CN=Services,CN=Configuration,DC=CORP,DC=LOCAL' % name,
+            'certificateTemplates': list(templates),
+            'flags': 0,
+            'cACertificate': [],
+        },
+        'raw_attributes': {'cACertificate': []},
+    }
+
+
+class TestEnterpriseCAProperties(unittest.TestCase):
+    def run_cas(self, entries, template_guids=None):
+        harness = CapturingCertEnumerator([], ca_entries=entries)
+        if template_guids:
+            harness.enumerator.template_guids = template_guids
+        harness.enumerator.enumerate_enterprise_cas()
+        return harness.captured
+
+    def test_domain_sid_is_emitted(self):
+        """
+        Without this the CA is not tied to the domain it issues for, which is
+        what the root CA and NTAuth store objects use their DomainSID for too.
+        """
+        cas = self.run_cas([enterprise_ca_entry(
+            'CCCCCCCC-0000-0000-0000-000000000001', 'Issuing-CA', 'ca01.corp.local')])
+        self.assertEqual(len(cas), 1)
+        self.assertEqual(cas[0]['DomainSID'], 'S-1-5-21-1-2-3')
+
+    def test_published_templates_become_enabled_cert_templates(self):
+        # This is what BloodHound turns into the PublishedTo edge
+        cas = self.run_cas(
+            [enterprise_ca_entry('CCCCCCCC-0000-0000-0000-000000000001', 'Issuing-CA',
+                                 'ca01.corp.local', templates=['WebServer', 'Gone'])],
+            template_guids={'webserver': 'AAAAAAAA-0000-0000-0000-000000000001'})
+        ca = cas[0]
+        self.assertEqual(ca['EnabledCertTemplates'],
+                         [{'ObjectIdentifier': 'AAAAAAAA-0000-0000-0000-000000000001',
+                           'ObjectType': 'CertTemplate'}])
+        # A template a CA publishes but that we could not read is reported
+        self.assertEqual(ca['Properties']['unresolvedpublishedtemplates'], ['Gone'])
+
+    def test_ca_properties_bloodhound_reads_are_present(self):
+        cas = self.run_cas([enterprise_ca_entry(
+            'CCCCCCCC-0000-0000-0000-000000000001', 'Issuing-CA', 'ca01.corp.local')])
+        for name in ('caname', 'dnshostname', 'certthumbprint', 'certname', 'certchain',
+                     'hasbasicconstraints', 'basicconstraintpathlength',
+                     'unresolvedpublishedtemplates'):
+            self.assertIn(name, cas[0]['Properties'],
+                          '%s is read by BloodHound and must be emitted' % name)
