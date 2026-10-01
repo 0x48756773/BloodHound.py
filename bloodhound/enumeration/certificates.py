@@ -45,11 +45,13 @@ from bloodhound.ad.adcs import (
     CT_FLAG_SUBJECT_ALT_REQUIRE_SPN,
     CT_FLAG_SUBJECT_ALT_REQUIRE_UPN,
     CT_FLAG_SUBJECT_REQUIRE_EMAIL,
+    certificate_identity,
     effective_ekus,
     filetime_to_span,
     has_flag,
     is_authentication_template,
     parse_certificate,
+    select_current_certificate,
 )
 from bloodhound.ad.utils import ADUtils, AceResolver
 from bloodhound.enumeration.acls import AclEnumerator, parse_binary_acl
@@ -79,6 +81,10 @@ class CertificateServicesEnumerator(object):
         # from, which is what BloodHound's 'enabled' property means, so this
         # has to be known before the templates themselves are written out.
         self.published_templates = set()
+        # CA certificates indexed for chain building: thumbprint -> identity,
+        # and subject -> thumbprint so an issuer can be looked up
+        self.ca_certificates = {}
+        self.ca_subjects = {}
         # Cache for DNS hostname -> computer SID lookups
         self.hostname_sids = {}
         # Whether the current output file has been closed off. Starts True
@@ -184,25 +190,91 @@ class CertificateServicesEnumerator(object):
             props['whencreated'] = whencreated
         return props
 
-    def add_certificate_properties(self, props, entry):
+    @staticmethod
+    def certificates_of(entry):
         """
-        Decode the cACertificate attribute onto the given properties dict.
-        Multi-valued in the schema, but the CA objects BloodHound cares about
-        publish a single current certificate.
+        The cACertificate values of a CA object, always as a list. A renewed CA
+        keeps its superseded certificates here.
         """
         certificates = ADUtils.get_entry_property(entry, 'cACertificate', [], raw=True)
         if isinstance(certificates, (bytes, bytearray)):
             certificates = [certificates]
-        certificate = certificates[0] if certificates else None
+        return [certificate for certificate in certificates if certificate]
+
+    def prefetch_ca_certificates(self):
+        """
+        Read every CA certificate in the forest once and index it by subject.
+
+        A certificate's issuer is the subject of the certificate above it, so
+        this index is what lets each CA's chain be followed up to its root.
+        BloodHound builds the IssuedSignedBy edges from those chains, and the
+        ESC paths require an issuing CA to reach a root CA that is trusted for
+        the domain - so a chain holding only the CA's own thumbprint leaves
+        every issuing CA disconnected from its root.
+        """
+        getters = (self.addc.get_enterprise_cas, self.addc.get_root_cas, self.addc.get_aia_cas)
+        for getter in getters:
+            try:
+                entries = getter()
+            except Exception as exc:
+                logging.debug('Could not read CA objects for the certificate chain: %s', exc)
+                continue
+            for entry in entries:
+                for certificate in self.certificates_of(entry):
+                    identity = certificate_identity(certificate)
+                    thumbprint = identity['thumbprint']
+                    if not thumbprint or not identity['subject']:
+                        continue
+                    self.ca_certificates[thumbprint] = identity
+                    # Several CA objects publish the same certificate, and a
+                    # renewed CA has more than one with the same subject. Keep
+                    # the first; which of the duplicates we index does not
+                    # matter since they share a subject.
+                    self.ca_subjects.setdefault(identity['subject'], thumbprint)
+        logging.debug('Indexed %d CA certificate(s) for chain building', len(self.ca_certificates))
+
+    def build_certificate_chain(self, thumbprint):
+        """
+        Walk from a certificate up to its root, returning the thumbprints from
+        the certificate itself outwards.
+
+        Stops at a self-signed certificate, at one whose issuer we have no
+        certificate for, and on a loop - a cross-signed set can otherwise
+        chain back on itself.
+        """
+        if not thumbprint:
+            return []
+        chain = [thumbprint]
+        seen = {thumbprint}
+        current = self.ca_certificates.get(thumbprint)
+        while current:
+            subject, issuer = current['subject'], current['issuer']
+            if not issuer or issuer == subject:
+                # Self-signed, so this is the root and the chain ends here
+                break
+            parent = self.ca_subjects.get(issuer)
+            if not parent or parent in seen:
+                break
+            chain.append(parent)
+            seen.add(parent)
+            current = self.ca_certificates.get(parent)
+        return chain
+
+    def add_certificate_properties(self, props, entry):
+        """
+        Decode the cACertificate attribute onto the given properties dict.
+        """
+        certificate = select_current_certificate(self.certificates_of(entry))
         parsed = parse_certificate(certificate)
         props['certthumbprint'] = parsed['thumbprint']
         # The certificate's own subject, falling back to the directory object's
         # name when the certificate could not be parsed
         props['certname'] = parsed['name'] or ADUtils.get_entry_property(entry, 'name')
-        # Only this certificate's own thumbprint: assembling the full chain
-        # needs the issuing CAs, which BloodHound resolves from the other CA
-        # objects once they are all ingested.
-        props['certchain'] = parsed['chain']
+        # The chain up to the root, when the other CA certificates have been
+        # indexed. Falls back to this certificate alone, which is correct for a
+        # self-signed root and all we can say for anything else.
+        chain = self.build_certificate_chain(parsed['thumbprint'])
+        props['certchain'] = chain or parsed['chain']
         props['hasbasicconstraints'] = parsed['hasbasicconstraints']
         props['basicconstraintpathlength'] = parsed['basicconstraintpathlength']
         return parsed
@@ -523,6 +595,9 @@ class CertificateServicesEnumerator(object):
         # Which templates the CAs publish decides the enabled flag on each
         # template, so this has to happen before they are written
         self.prefetch_published_templates()
+        # The CA certificates have to be indexed before any of them is written,
+        # since each one's chain is built by following issuers across the set
+        self.prefetch_ca_certificates()
         self.run_step(self.enumerate_cert_templates, timestamp)
         self.run_step(self.enumerate_enterprise_cas, timestamp)
         self.run_step(self.enumerate_ca_store, self.addc.get_root_cas, 'rootcas', 'rootca', 'rootcas.json', timestamp)
