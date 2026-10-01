@@ -135,6 +135,83 @@ def certificate_thumbprint(certdata):
     return hashlib.sha1(bytes(certdata)).hexdigest().upper()
 
 
+def load_certificate(certdata):
+    """
+    Parse a DER encoded certificate, or return None when it cannot be read or
+    `cryptography` is not installed.
+    """
+    if not certdata:
+        return None
+    try:
+        from cryptography import x509
+    except ImportError:
+        logging.debug('cryptography is not installed, only reporting certificate thumbprints')
+        return None
+    try:
+        return x509.load_der_x509_certificate(bytes(certdata))
+    except Exception as exc:
+        logging.debug('Could not parse certificate: %s', exc)
+        return None
+
+
+def select_current_certificate(certificates):
+    """
+    Pick a CA's current certificate out of a multi-valued cACertificate.
+
+    A CA that has been renewed keeps its superseded certificates on the
+    directory object. BloodHound records one thumbprint per CA and matches it
+    against the NTAuth store, so picking a superseded certificate silently
+    breaks that match and with it every certificate attack path through the CA.
+    The certificate that expires last is the current one.
+    """
+    if not certificates:
+        return None
+    if len(certificates) == 1:
+        return certificates[0]
+
+    newest = None
+    newest_expiry = None
+    for certificate in certificates:
+        parsed = load_certificate(certificate)
+        if parsed is None:
+            continue
+        try:
+            # not_valid_after_utc replaces the naive accessor in newer
+            # cryptography releases
+            expiry = getattr(parsed, 'not_valid_after_utc', None) or parsed.not_valid_after
+        except Exception:
+            continue
+        if newest_expiry is None or expiry > newest_expiry:
+            newest, newest_expiry = certificate, expiry
+    # If none of them could be parsed we have no basis to choose, so keep the
+    # existing behaviour of taking the first
+    return newest if newest is not None else certificates[0]
+
+
+def certificate_identity(certdata):
+    """
+    The subject and issuer of a certificate, plus its thumbprint.
+
+    Used to assemble the CA hierarchy: a certificate's issuer is the subject of
+    the certificate above it, which is how an issuing CA is tied to its root.
+    Both names are rendered with the same encoder so they compare directly.
+    """
+    identity = {
+        'thumbprint': certificate_thumbprint(certdata),
+        'subject': None,
+        'issuer': None,
+    }
+    certificate = load_certificate(certdata)
+    if certificate is None:
+        return identity
+    try:
+        identity['subject'] = certificate.subject.rfc4514_string()
+        identity['issuer'] = certificate.issuer.rfc4514_string()
+    except Exception as exc:
+        logging.debug('Could not read certificate subject or issuer: %s', exc)
+    return identity
+
+
 def parse_certificate(certdata):
     """
     Pull the fields BloodHound wants out of a DER encoded certificate.
@@ -148,6 +225,8 @@ def parse_certificate(certdata):
         'thumbprint': certificate_thumbprint(certdata),
         'name': None,
         'chain': [],
+        'subject': None,
+        'issuer': None,
         'hasbasicconstraints': False,
         'basicconstraintpathlength': 0,
     }
@@ -161,11 +240,15 @@ def parse_certificate(certdata):
         logging.debug('cryptography is not installed, only reporting certificate thumbprints')
         return result
 
-    try:
-        cert = x509.load_der_x509_certificate(bytes(certdata))
-    except Exception as exc:
-        logging.debug('Could not parse certificate: %s', exc)
+    cert = load_certificate(certdata)
+    if cert is None:
         return result
+
+    try:
+        result['subject'] = cert.subject.rfc4514_string()
+        result['issuer'] = cert.issuer.rfc4514_string()
+    except Exception as exc:
+        logging.debug('Could not read certificate subject or issuer: %s', exc)
 
     try:
         common_names = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
